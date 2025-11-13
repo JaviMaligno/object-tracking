@@ -2,10 +2,12 @@
 venv
 ffmpeg
 coords.csv
+*.csv
 IMG_3048_con_Arjona.mov
 IMG_3048_con_Arjona_converted.mp4
 *.mov
 *.mp4
+*.mp3
 *.avi
 *.mkv
 *.flv

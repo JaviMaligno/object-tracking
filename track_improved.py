@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Tracking amélioré avec détection des problèmes et visualisation
+Tracking mejorado con navegación bidireccional e interpolación
+Permite avanzar/retroceder durante el tracking
 """
 
 import cv2
@@ -12,11 +13,12 @@ from pathlib import Path
 
 def select_and_track_improved(video_path, output_csv="coords.csv", start_time=0, tracker_type="CSRT"):
     """
-    Tracking amélioré avec:
-    - Détection de perte de tracking
-    - Visualisation du problème
-    - Possibilité de réinitialiser (touche R)
-    - Choix du tracker
+    Tracking mejorado con navegación completa:
+    - Retroceder/avanzar frame por frame
+    - Saltar segundos adelante/atrás
+    - Detección de problemas
+    - Reinicialización
+    - Interpolación automática de frames no trackeados
     """
 
     if not os.path.exists(video_path):
@@ -30,13 +32,13 @@ def select_and_track_improved(video_path, output_csv="coords.csv", start_time=0,
         print("ERROR: Cannot open video")
         sys.exit(1)
 
-    # Lire la première image
+    # Leer la primera frame
     ok, frame = video.read()
     if not ok:
         print("ERROR: Cannot read first frame")
         sys.exit(1)
 
-    # Propriétés vidéo
+    # Propiedades del video
     fps = video.get(cv2.CAP_PROP_FPS)
     total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
     width = int(video.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -49,7 +51,7 @@ def select_and_track_improved(video_path, output_csv="coords.csv", start_time=0,
     print(f"   Duration: {total_frames/fps:.1f} seconds")
     print()
 
-    # Si start_time spécifié, aller à cette position
+    # Si start_time especificado, ir a esa posición
     start_frame = 0
     if start_time > 0:
         start_frame = int(start_time * fps)
@@ -61,14 +63,14 @@ def select_and_track_improved(video_path, output_csv="coords.csv", start_time=0,
             sys.exit(1)
         print()
 
-    # Sélection manuelle
+    # Selección manual inicial
     print("INSTRUCTIONS:")
     print("   1. CLICK AND DRAG to draw rectangle around BOTH dancers")
     print("   2. Make the rectangle LARGE (include space around them)")
     print("   3. Press ENTER to start tracking")
     print()
 
-    # Redimensionner pour affichage
+    # Redimensionar para display
     display_frame = frame.copy()
     scale = 1.0
     max_display_height = 1000
@@ -84,7 +86,7 @@ def select_and_track_improved(video_path, output_csv="coords.csv", start_time=0,
     bbox = cv2.selectROI("Select dancers (ENTER to validate)", display_frame, False, False)
     cv2.destroyWindow("Select dancers (ENTER to validate)")
 
-    # Rescale bbox si nécessaire
+    # Rescale bbox si necesario
     if scale != 1.0:
         bbox = tuple(int(val / scale) for val in bbox)
 
@@ -97,7 +99,7 @@ def select_and_track_improved(video_path, output_csv="coords.csv", start_time=0,
     print(f"Selected area: x={bbox[0]}, y={bbox[1]}, w={bbox[2]}, h={bbox[3]}")
     print()
 
-    # Créer le tracker
+    # Crear el tracker
     print(f"Creating {tracker_type} tracker...")
 
     if tracker_type == "CSRT":
@@ -114,34 +116,63 @@ def select_and_track_improved(video_path, output_csv="coords.csv", start_time=0,
 
     tracker.init(frame, bbox)
 
-    # Variables de tracking
-    coords = []
-    frame_count = start_frame
+    # Variables de tracking - USAR DICCIONARIO
+    coords_dict = {}
+    current_frame = start_frame
 
-    # Statistiques pour détecter les problèmes
+    # Estadísticas
     initial_area = bbox[2] * bbox[3]
     lost_count = 0
     size_history = [initial_area]
 
+    # Estado
+    auto_tracking = True
+    last_tracked_frame = current_frame - 1
+    last_bbox = bbox
+
     print("Tracking started...")
     print()
     print("CONTROLS:")
-    print("   ESC = Stop tracking")
-    print("   R = Re-initialize (select dancers again)")
-    print("   SPACE = Pause/Resume")
+    print("   ESC = Stop and save")
+    print("   SPACE = Pause/Resume auto-tracking")
+    print("   R = Re-initialize tracker")
+    print()
+    print("   A/D = Navigate ±10 frames")
+    print("   W/S = Jump ±5 seconds")
     print()
 
-    paused = False
-
     while True:
-        if not paused:
-            ok, frame = video.read()
-            if not ok:
+        # Leer el frame actual
+        video.set(cv2.CAP_PROP_POS_FRAMES, current_frame)
+        ok, frame = video.read()
+
+        if not ok:
+            if current_frame >= total_frames:
+                print("\nEnd of video reached")
+                break
+            else:
+                print(f"\nWarning: Cannot read frame {current_frame}")
                 break
 
-            frame_count += 1
+        # Determinar si debemos trackear este frame
+        should_track = False
 
-            # Mettre à jour le tracker
+        if auto_tracking and current_frame > last_tracked_frame:
+            should_track = True
+
+        # Color y status
+        color = (128, 128, 128)  # Gris por defecto
+        status = "NAVIGATING"
+
+        # Si ya tenemos coordenadas para este frame, mostrarlas
+        if current_frame in coords_dict:
+            _, x, y, w, h = coords_dict[current_frame]
+            color = (0, 255, 0)  # Verde
+            status = "TRACKED ✓"
+            cv2.rectangle(frame, (x, y), (x+w, y+h), color, 3)
+
+        elif should_track:
+            # Trackear este frame
             ok, bbox = tracker.update(frame)
 
             if ok:
@@ -149,57 +180,80 @@ def select_and_track_improved(video_path, output_csv="coords.csv", start_time=0,
                 current_area = w * h
                 size_history.append(current_area)
 
-                # Garder seulement les 30 dernières frames
+                # Mantener solo las últimas 30 frames
                 if len(size_history) > 30:
                     size_history.pop(0)
 
-                coords.append((frame_count, x, y, w, h))
+                # Guardar coordenadas
+                coords_dict[current_frame] = (current_frame, x, y, w, h)
+                last_tracked_frame = current_frame
+                last_bbox = bbox
 
-                # Détecter les problèmes
+                # Detectar problemas
                 area_ratio = current_area / initial_area
                 recent_avg_area = sum(size_history) / len(size_history)
-                size_change = abs(current_area - recent_avg_area) / recent_avg_area
+                size_change = abs(current_area - recent_avg_area) / recent_avg_area if recent_avg_area > 0 else 0
 
-                # WARNING si le rectangle devient trop petit
-                color = (0, 255, 0)  # Vert = OK
-                status = "OK"
+                color = (0, 255, 0)  # Verde = OK
+                status = "TRACKING"
 
                 if area_ratio < 0.3:
-                    color = (0, 0, 255)  # Rouge = MAUVAIS
+                    color = (0, 0, 255)  # Rojo
                     status = "WARNING: Box too small!"
                     lost_count += 1
                 elif area_ratio < 0.5:
-                    color = (0, 165, 255)  # Orange = ATTENTION
+                    color = (0, 165, 255)  # Naranja
                     status = "ATTENTION: Box shrinking"
                 elif size_change > 0.2:
                     color = (0, 165, 255)
-                    status = "ATTENTION: Sudden size change"
+                    status = "ATTENTION: Sudden change"
 
-                # Dessiner le rectangle
                 cv2.rectangle(frame, (x, y), (x+w, y+h), color, 3)
-
-                # Informations
-                cv2.putText(frame, f"Frame: {frame_count}/{total_frames}",
-                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-                cv2.putText(frame, f"Size: {w}x{h} (ratio: {area_ratio:.2f})",
-                           (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-                cv2.putText(frame, status,
-                           (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-                cv2.putText(frame, "R=Reinit SPACE=Pause ESC=Stop",
-                           (10, height-20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
             else:
                 lost_count += 1
-                cv2.putText(frame, "TRACKING LOST! Press R to reinitialize",
-                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                color = (0, 0, 255)
+                status = "TRACKING LOST! Press R"
+                cv2.putText(frame, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
+                auto_tracking = False  # Parar auto-tracking si se pierde
 
-            # Afficher la progression
-            if frame_count % 30 == 0:
-                progress = (frame_count / total_frames) * 100
-                print(f"   Progress: {progress:.1f}% ({frame_count}/{total_frames}) - Lost: {lost_count} times")
+        elif last_bbox is not None:
+            # Mostrar último bbox conocido en gris
+            x, y, w, h = [int(v) for v in last_bbox]
+            cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
 
-        # Afficher la frame
+        # Información en pantalla
+        mode_text = "AUTO" if auto_tracking else "MANUAL"
+        time_current = current_frame / fps
+        time_total = total_frames / fps
+
+        # Línea 1: Frame y tiempo
+        cv2.putText(frame, f"Frame: {current_frame}/{total_frames} | {time_current:.1f}/{time_total:.1f}s",
+                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+        # Línea 2: Status y modo
+        cv2.putText(frame, f"Status: {status} | Mode: {mode_text}",
+                   (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+        # Línea 3: Coordenadas si hay
+        if current_frame in coords_dict or (should_track and ok):
+            cv2.putText(frame, f"Box: {w}x{h} | Tracked: {len(coords_dict)} frames",
+                       (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+        # Controles en la parte inferior
+        controls_y = height - 60
+        cv2.putText(frame, "A/D +/-10f | W/S +/-5s",
+                   (10, controls_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(frame, "R=Reinit | SPACE=Auto/Manual | ESC=Exit",
+                   (10, controls_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+        # Progreso cada 30 frames
+        if auto_tracking and current_frame % 30 == 0:
+            progress = (current_frame / total_frames) * 100
+            print(f"   Progress: {progress:.1f}% ({current_frame}/{total_frames}) - Tracked: {len(coords_dict)} frames")
+
+        # Display
         display_frame = frame
-        max_width = 800
+        max_width = 1200
         max_height = 1000
 
         if width > max_width or height > max_height:
@@ -208,19 +262,38 @@ def select_and_track_improved(video_path, output_csv="coords.csv", start_time=0,
             scale = min(scale_w, scale_h)
             display_frame = cv2.resize(frame, None, fx=scale, fy=scale)
 
-        cv2.imshow("Tracking (ESC=Stop, R=Reinit, SPACE=Pause)", display_frame)
+        cv2.imshow("Tracking (Controls shown on screen)", display_frame)
 
-        # Gestion des touches
-        key = cv2.waitKey(1) & 0xFF
+        # Manejo de teclas - capturar valor completo primero
+        key_full = cv2.waitKey(1 if auto_tracking else 30)
+        key = key_full & 0xFF
 
-        if key == 27:  # ESC
+        if key == 27:  # ESC - Salir
             print("\nStopping...")
             break
-        elif key == ord('r') or key == ord('R'):  # R pour réinitialiser
-            print("\n*** REINITIALIZING - Select dancers again ***")
-            paused = True
 
-            # Redimensionner pour affichage
+        elif key == ord(' '):  # SPACE - Toggle auto-tracking
+            auto_tracking = not auto_tracking
+            if auto_tracking:
+                print(f"AUTO-TRACKING RESUMED from frame {current_frame}")
+                # Reinicializar tracker con último bbox conocido
+                if last_bbox is not None:
+                    if tracker_type == "CSRT":
+                        tracker = cv2.TrackerCSRT_create()
+                    elif tracker_type == "KCF":
+                        tracker = cv2.legacy.TrackerKCF_create()
+                    elif tracker_type == "MOSSE":
+                        tracker = cv2.legacy.TrackerMOSSE_create()
+                    else:
+                        tracker = cv2.legacy.TrackerMIL_create()
+                    tracker.init(frame, last_bbox)
+            else:
+                print("MANUAL NAVIGATION MODE")
+
+        elif key == ord('r') or key == ord('R'):  # R - Reinicializar
+            print(f"\n*** REINITIALIZING at frame {current_frame} ***")
+
+            # Redimensionar para display
             display_frame_select = frame.copy()
             if height > max_display_height:
                 display_frame_select = cv2.resize(frame, (display_width, display_height))
@@ -232,39 +305,88 @@ def select_and_track_improved(video_path, output_csv="coords.csv", start_time=0,
                 bbox = tuple(int(val / scale) for val in bbox)
 
             if bbox != (0, 0, 0, 0) and bbox[2] > 0 and bbox[3] > 0:
-                # Créer un nouveau tracker
+                # Crear nuevo tracker
                 if tracker_type == "CSRT":
                     tracker = cv2.TrackerCSRT_create()
                 elif tracker_type == "KCF":
                     tracker = cv2.legacy.TrackerKCF_create()
+                elif tracker_type == "MOSSE":
+                    tracker = cv2.legacy.TrackerMOSSE_create()
                 else:
-                    tracker = cv2.TrackerCSRT_create()
+                    tracker = cv2.legacy.TrackerMIL_create()
 
                 tracker.init(frame, bbox)
+                last_bbox = bbox
                 initial_area = bbox[2] * bbox[3]
                 size_history = [initial_area]
-                print(f"Reinitialized at frame {frame_count}")
-                paused = False
-            else:
-                print("Invalid selection, continuing with old tracker")
-                paused = False
 
-        elif key == ord(' '):  # SPACE pour pause
-            paused = not paused
-            if paused:
-                print("PAUSED")
+                # Guardar coordenadas de reinicialización
+                x, y, w, h = [int(v) for v in bbox]
+                coords_dict[current_frame] = (current_frame, x, y, w, h)
+                last_tracked_frame = current_frame
+
+                print(f"Reinitialized at frame {current_frame}")
+                auto_tracking = True  # Reanudar auto-tracking
             else:
-                print("RESUMED")
+                print("Invalid selection")
+
+        # Navegación con teclas A/D (10 frames)
+        elif key == ord('d') or key == ord('D'):  # D - Derecha 10 frames
+            auto_tracking = False
+            current_frame = min(current_frame + 10, total_frames - 1)
+
+        elif key == ord('a') or key == ord('A'):  # A - Izquierda 10 frames
+            auto_tracking = False
+            current_frame = max(current_frame - 10, start_frame)
+
+        # Navegación con teclas W/S (5 segundos)
+        elif key == ord('w') or key == ord('W'):  # W - Adelante 5s
+            auto_tracking = False
+            jump_frames = int(5 * fps)
+            current_frame = min(current_frame + jump_frames, total_frames - 1)
+            print(f"Jumped to frame {current_frame} (+5s)")
+
+        elif key == ord('s') or key == ord('S'):  # S - Atrás 5s
+            auto_tracking = False
+            jump_frames = int(5 * fps)
+            current_frame = max(current_frame - jump_frames, start_frame)
+            print(f"Jumped to frame {current_frame} (-5s)")
+
+        # PageUp/PageDown (si funcionan)
+        elif key == 33:  # PageUp
+            auto_tracking = False
+            jump_frames = int(30 * fps)
+            current_frame = min(current_frame + jump_frames, total_frames - 1)
+            print(f"Jumped to frame {current_frame} (+30s)")
+
+        elif key == 34:  # PageDown
+            auto_tracking = False
+            jump_frames = int(30 * fps)
+            current_frame = max(current_frame - jump_frames, start_frame)
+            print(f"Jumped to frame {current_frame} (-30s)")
+
+        # Avanzar frame si estamos en auto-tracking
+        if auto_tracking:
+            current_frame += 1
+            if current_frame >= total_frames:
+                print("\nEnd of video reached")
+                break
 
     video.release()
     cv2.destroyAllWindows()
 
     print()
-    print(f"Tracking completed! {len(coords)} frames tracked")
-    print(f"Lost tracking {lost_count} times")
+    print(f"Tracking completed!")
+    print(f"   Frames tracked: {len(coords_dict)}")
+    print(f"   Total frames: {total_frames}")
+    print(f"   Coverage: {(len(coords_dict)/total_frames)*100:.1f}%")
+    print(f"   Lost tracking: {lost_count} times")
     print()
 
-    # Sauvegarder
+    # Convertir diccionario a lista ordenada
+    coords = sorted(coords_dict.values(), key=lambda x: x[0])
+
+    # Guardar
     print(f"Saving coordinates to '{output_csv}'...")
     with open(output_csv, "w", newline="") as f:
         writer = csv.writer(f)
@@ -272,6 +394,27 @@ def select_and_track_improved(video_path, output_csv="coords.csv", start_time=0,
         writer.writerows(coords)
 
     print(f"File '{output_csv}' created successfully!")
+    print()
+
+    # Detectar gaps
+    if len(coords) > 1:
+        gaps = []
+        for i in range(len(coords) - 1):
+            gap_size = coords[i+1][0] - coords[i][0] - 1
+            if gap_size > 0:
+                gaps.append((coords[i][0], coords[i+1][0], gap_size))
+
+        if gaps:
+            print(f"Found {len(gaps)} gaps in tracking:")
+            for start, end, size in gaps[:5]:  # Mostrar solo los primeros 5
+                print(f"   Frames {start} to {end}: {size} frames will be interpolated")
+            if len(gaps) > 5:
+                print(f"   ... and {len(gaps) - 5} more gaps")
+            print()
+            print("These gaps will be interpolated during export.")
+        else:
+            print("No gaps found - complete continuous tracking!")
+
     print()
     print("Statistics:")
     print(f"   Frames tracked: {len(coords)}/{total_frames}")
@@ -282,10 +425,10 @@ def select_and_track_improved(video_path, output_csv="coords.csv", start_time=0,
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python track_dancers_improved.py <video_path> [output.csv] [options]")
+        print("Usage: python track_improved.py <video_path> [output.csv] [options]")
         print("\nExample:")
-        print("  python track_dancers_improved.py video.mov")
-        print("  python track_dancers_improved.py video.mov coords.csv --start-time 30 --tracker KCF")
+        print("  python track_improved.py video.mov")
+        print("  python track_improved.py video.mov coords.csv --start-time 30 --tracker KCF")
         print("\nOptions:")
         print("  --start-time SECONDS    Start tracking from this time (default: 0)")
         print("  --tracker TYPE          Tracker type: CSRT, KCF, MOSSE, MIL (default: CSRT)")

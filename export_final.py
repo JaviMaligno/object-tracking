@@ -28,6 +28,62 @@ def load_coordinates(csv_path):
     return coords
 
 
+def interpolate_gaps(coords):
+    """
+    Interpola coordenadas faltantes entre frames trackeados
+    Retorna lista completa con todos los frames interpolados
+    """
+    if len(coords) < 2:
+        return coords
+
+    # Detectar gaps
+    gaps_found = []
+    for i in range(len(coords) - 1):
+        gap_size = coords[i+1][0] - coords[i][0] - 1
+        if gap_size > 0:
+            gaps_found.append((coords[i][0], coords[i+1][0], gap_size))
+
+    if not gaps_found:
+        print("   No gaps found - continuous tracking")
+        return coords
+
+    print(f"   Found {len(gaps_found)} gaps, interpolating...")
+    total_interpolated = sum(g[2] for g in gaps_found)
+    print(f"   Total frames to interpolate: {total_interpolated}")
+
+    # Crear lista completa con interpolación
+    result = []
+
+    for i in range(len(coords) - 1):
+        current_frame, x1, y1, w1, h1 = coords[i]
+        next_frame, x2, y2, w2, h2 = coords[i + 1]
+
+        # Agregar frame actual
+        result.append((current_frame, x1, y1, w1, h1))
+
+        # Interpolar frames entre current y next
+        gap_size = next_frame - current_frame - 1
+
+        if gap_size > 0:
+            for j in range(1, gap_size + 1):
+                # Interpolación lineal
+                ratio = j / (gap_size + 1)
+                interp_frame = current_frame + j
+                interp_x = int(x1 + (x2 - x1) * ratio)
+                interp_y = int(y1 + (y2 - y1) * ratio)
+                interp_w = int(w1 + (w2 - w1) * ratio)
+                interp_h = int(h1 + (h2 - h1) * ratio)
+
+                result.append((interp_frame, interp_x, interp_y, interp_w, interp_h))
+
+    # Agregar último frame
+    result.append(coords[-1])
+
+    print(f"   Interpolation complete: {len(coords)} -> {len(result)} frames")
+
+    return result
+
+
 def stabilize_and_smooth_coordinates(coords, smooth_window=15):
     """Stabilise et lisse les coordonnées"""
     if len(coords) < smooth_window:
@@ -150,6 +206,10 @@ def crop_and_export_fixed_ratio(video_path, coords_csv, output_path="output.mov"
     print(f"Loaded {len(coords)} coordinates")
     print()
 
+    print(f"Interpolating missing frames...")
+    coords = interpolate_gaps(coords)
+    print()
+
     print(f"Stabilizing and smoothing (window={smooth_window})...")
     coords = stabilize_and_smooth_coordinates(coords, smooth_window)
     print()
@@ -252,8 +312,19 @@ def crop_and_export_fixed_ratio(video_path, coords_csv, output_path="output.mov"
     # Ajouter l'audio
     print("Converting to MOV with H.264 and adding audio...")
 
+    # Buscar FFmpeg en la ubicación local primero
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    ffmpeg_local = os.path.join(script_dir, 'ffmpeg', 'bin', 'ffmpeg.exe')
+
+    if os.path.exists(ffmpeg_local):
+        ffmpeg_cmd = ffmpeg_local
+        print(f"   Using local FFmpeg: {ffmpeg_cmd}")
+    else:
+        ffmpeg_cmd = 'ffmpeg'
+        print("   Using system FFmpeg")
+
     cmd = [
-        'ffmpeg',
+        ffmpeg_cmd,
         '-i', temp_output,
         '-i', video_path,
         '-map', '0:v',
@@ -271,12 +342,20 @@ def crop_and_export_fixed_ratio(video_path, coords_csv, output_path="output.mov"
     ]
 
     try:
-        subprocess.run(cmd, check=True, capture_output=True)
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
         print("Audio added successfully!")
         os.remove(temp_output)
-    except subprocess.CalledProcessError:
+    except FileNotFoundError:
+        print("ERROR: FFmpeg not found!")
+        print(f"Tried: {ffmpeg_cmd}")
+        print("Output file WITHOUT audio saved as: {temp_output}")
+        print("\nPlease install FFmpeg or ensure it's in the correct location.")
+        return False
+    except subprocess.CalledProcessError as e:
         print("WARNING: Could not add audio")
+        print(f"FFmpeg error: {e.stderr}")
         print(f"Output file without audio: {temp_output}")
+        return False
 
     print()
     print("=" * 50)
