@@ -163,8 +163,45 @@ class TrackingThread(QThread):
             # Main tracking loop - use original logic
             while self.core.current_frame < self.core.total_frames and not self.should_stop:
                 # Handle pause (wait while not auto_tracking)
+                # CRITICAL: Must actively read and display frames while paused
+                # This matches original behavior where loop ALWAYS reads current_frame
+                # Enables navigation with A/D/W/S keys
                 while not self.core.auto_tracking and not self.should_stop:
-                    time.sleep(0.1)
+                    # Read and display current frame (navigation updates current_frame)
+                    result = self.core.process_frame()
+
+                    if result:
+                        # Display the frame with appropriate bbox
+                        frame_cv = result['frame']
+                        bbox = result['bbox']
+                        color_bgr = result['color']
+                        status = result['status']
+
+                        # Convert BGR color to string
+                        if color_bgr == (0, 255, 0):
+                            color = 'green'
+                        elif color_bgr == (0, 165, 255):
+                            color = 'orange'
+                        elif color_bgr == (0, 0, 255):
+                            color = 'red'
+                        elif color_bgr == (128, 128, 128):
+                            color = 'gray'
+                        else:
+                            color = 'green'
+
+                        frame_copy = frame_cv.copy()
+
+                        # Emit frame for display
+                        if bbox:
+                            self.frame_tracked.emit(self.core.current_frame, bbox, color, frame_copy)
+                        else:
+                            self.frame_tracked.emit(self.core.current_frame, None, color, frame_copy)
+
+                        # Update progress with paused status
+                        self.progress_update.emit(self.core.current_frame, self.core.total_frames, f"PAUSED - {status}")
+
+                    # Wait 30ms like original waitKey(30) when paused
+                    time.sleep(0.03)
 
                     # Handle manual reinitialization (user pressed R)
                     if self.should_reinitialize:

@@ -4,6 +4,7 @@ Compatible con la arquitectura existente del proyecto
 Genera coords.csv compatible con export_final.py
 """
 
+import sys
 import cv2
 import csv
 import numpy as np
