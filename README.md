@@ -2,6 +2,8 @@
 
 Sistema completo para seguir y recortar automáticamente bailarines en videos, **sin GPU** y preservando la calidad original.
 
+**✨ NUEVO:** Interfaz gráfica tipo editor de video - ¡No más línea de comandos!
+
 ---
 
 ## 🚀 Inicio Rápido
@@ -12,7 +14,23 @@ Sistema completo para seguir y recortar automáticamente bailarines en videos, *
 - Descargar: https://www.python.org/downloads/
 - ⚠️ **IMPORTANTE:** Marcar "Add Python to PATH" durante la instalación
 
-### 2. Uso
+### 2. Uso - Interfaz Gráfica (RECOMENDADO)
+
+**Doble-click en:**
+```
+start_ui.bat
+```
+
+La interfaz gráfica incluye:
+- 🎥 **Reproductor de video integrado** con controles tipo editor
+- ⏯️ **Controles de reproducción:** Play, Pause, Frame-by-frame, saltos temporales
+- 📊 **Timeline visual** con estado de tracking por frame
+- 🎯 **Tracking interactivo** en tiempo real con indicadores de calidad
+- ⚙️ **Configuración visual** con sliders y dropdowns
+- 🎬 **Export con un click** y barra de progreso
+- ⌨️ **Keyboard shortcuts:** Espacio, R, ESC, flechas, A/D
+
+### 3. Uso - Línea de Comandos (Avanzado)
 
 **Doble-click en:**
 ```
@@ -140,6 +158,71 @@ python export_final.py video.mov coords.csv output.mov --margin 1.5 --smooth 10
 
 ---
 
+## 🖥️ Interfaz Gráfica - Guía de Uso
+
+### Workflow en la UI
+
+1. **Cargar Video**
+   - Click en "Abrir Video..."
+   - Selecciona tu archivo de video
+   - Opcionalmente cambia el audio con "Cambiar Audio..."
+   - Puedes usar coordenadas existentes marcando el checkbox
+
+2. **Configurar Tracking**
+   - Selecciona el tipo de tracker (KCF recomendado)
+   - Indica si ambos bailarines están visibles desde el inicio
+   - Si no, especifica el tiempo de inicio en segundos
+   - Click en "🎯 Seleccionar Área"
+
+3. **Tracking Interactivo**
+   - Dibuja un rectángulo alrededor de los bailarines
+   - Presiona **Espacio** o **Reanudar** para iniciar el tracking
+   - **Verde** = Tracking OK
+   - **Naranja** = Advertencia
+   - **Rojo** = Problema - presiona R para re-seleccionar el área
+   - **Pausa y navegación libre:**
+     - Presiona **Espacio** para pausar el tracking
+     - Navega libremente con flechas, botones o timeline
+     - El rectángulo se mantiene visible como referencia
+     - Presiona **Espacio** o **Reanudar** para continuar desde donde estés
+   - Si el tracking se pierde, presiona **R** para volver a dibujar el rectángulo
+   - Después de re-dibujar, presiona **Espacio** o **Reanudar** para continuar
+   - Los frames ya trackeados se saltan automáticamente (no se trackean dos veces)
+
+4. **Configurar Export**
+   - Ajusta el margen con el slider (1.0-2.5x)
+   - Ajusta el suavizado con el slider (5-30 frames)
+   - Especifica el nombre del archivo de salida
+   - Click en "Exportar Video"
+
+5. **Ver Resultado**
+   - Espera a que termine la exportación
+   - La UI te preguntará si quieres abrir la carpeta
+   - ¡Listo!
+
+### Keyboard Shortcuts
+
+| Tecla | Función |
+|-------|---------|
+| **Espacio** | Pausar/Reanudar tracking (o Play/Pause cuando no hay tracking) |
+| **Enter/Intro** | Pausar/Reanudar tracking |
+| **←/→** | Frame anterior/siguiente (±1 frame) |
+| **A/D** | Saltar ±10 frames |
+| **W/S** | Saltar ±5 segundos |
+| **R** | Re-seleccionar área (durante tracking) |
+| **ESC** | Detener tracking |
+
+**Nota:** Los atajos de teclado coinciden con el script original `track_improved.py`. También hay botones adicionales para navegación más precisa (±1 frame, ±1 segundo).
+
+### Componentes de la UI
+
+- **Panel superior:** Carga de archivos y video info
+- **Reproductor central:** Video con overlay de tracking
+- **Controles de reproducción:** Play, pause, navegación, velocidad
+- **Timeline:** Visualización del estado por frame con zoom
+- **Panel derecho:** Configuración de tracking y export
+- **Log:** Mensajes y estado de las operaciones
+
 ## 📂 Estructura del Proyecto
 
 ```
@@ -147,7 +230,15 @@ dancer_tracking/
 ├── README.md                    # Este archivo
 ├── requirements.txt             # Dependencias Python
 │
-├── dancer_tracking.bat          # Script maestro (USAR ESTE)
+├── start_ui.bat                 # LAUNCHER UI (RECOMENDADO)
+├── dancer_tracking.bat          # Script consola (alternativo)
+│
+├── dancer_tracking_ui.py        # Aplicación principal de la UI
+├── video_player.py              # Widget de video player
+├── timeline_widget.py           # Widget de timeline
+├── tracking_thread.py           # Thread de tracking
+├── export_thread.py             # Thread de export
+├── test_ui.py                   # Test de imports de UI
 │
 ├── track_improved.py            # Tracking con detección de problemas
 ├── export_final.py              # Export final con calidad preservada

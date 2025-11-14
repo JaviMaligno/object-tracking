@@ -11,6 +11,347 @@ import os
 from pathlib import Path
 
 
+class TrackerCore:
+    """
+    Core tracking logic extracted from track_improved.py.
+    Can be used standalone or embedded in UI.
+    Maintains EXACT same behavior as original command-line version.
+    """
+
+    def __init__(self, video_path, tracker_type="CSRT", start_frame=0):
+        self.video_path = video_path
+        self.tracker_type = tracker_type
+        self.start_frame = start_frame
+
+        # State variables (from original lines 119-131)
+        self.coords_dict = {}
+        self.current_frame = start_frame
+        self.auto_tracking = True
+        self.last_tracked_frame = start_frame - 1
+        self.last_bbox = None
+
+        # Video properties
+        self.video = None
+        self.fps = 30
+        self.total_frames = 0
+        self.width = 0
+        self.height = 0
+
+        # Tracker
+        self.tracker = None
+        self.initial_area = 0
+        self.size_history = []
+        self.lost_count = 0
+
+        # Frame cache for seek optimization
+        self.last_read_frame_number = -1  # Track last frame position
+        self.cached_frame = None  # Cache last read frame
+
+    def open_video(self):
+        """
+        Open video and read properties
+
+        FIX: Add decoder stabilization delay after large seeks to prevent
+        async_lock errors when jumping to non-zero start frames.
+        """
+        if not os.path.exists(self.video_path):
+            raise FileNotFoundError(f"Video '{self.video_path}' not found")
+
+        self.video = cv2.VideoCapture(self.video_path)
+        if not self.video.isOpened():
+            raise RuntimeError("Cannot open video")
+
+        self.fps = self.video.get(cv2.CAP_PROP_FPS)
+        self.total_frames = int(self.video.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.width = int(self.video.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.height = int(self.video.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        # Seek to start frame
+        if self.start_frame > 0:
+            try:
+                self.video.set(cv2.CAP_PROP_POS_FRAMES, self.start_frame)
+                self.current_frame = self.start_frame
+                self.last_read_frame_number = self.start_frame - 1
+
+                # Give decoder time to stabilize after large seek
+                # Critical for preventing async_lock errors on initial seek
+                cv2.waitKey(30)
+            except Exception as e:
+                print(f"Warning: Seek to start frame {self.start_frame} failed: {e}")
+                return False
+
+        return True
+
+    def initialize_tracker(self, bbox):
+        """
+        Initialize tracker with bbox (from lines 102-117)
+
+        FIX: Cache the frame and update position tracking to prevent
+        redundant seeks in subsequent process_frame() calls.
+        """
+        # Read frame at current position and cache it
+        try:
+            self.video.set(cv2.CAP_PROP_POS_FRAMES, self.current_frame)
+        except Exception as e:
+            print(f"Warning: Seek failed in initialize_tracker: {e}")
+            return False
+
+        ok, frame = self.video.read()
+        if not ok:
+            return False
+
+        # Update position tracking and cache
+        self.last_read_frame_number = self.current_frame
+        self.cached_frame = frame.copy()
+
+        # Create tracker
+        self.tracker = self._create_tracker(self.tracker_type)
+        if not self.tracker:
+            return False
+
+        self.tracker.init(frame, bbox)
+        self.last_bbox = bbox
+        self.initial_area = bbox[2] * bbox[3]
+        self.size_history = [self.initial_area]
+
+        return True
+
+    def _create_tracker(self, tracker_type):
+        """Create OpenCV tracker (from lines 105-115)"""
+        if tracker_type == "CSRT":
+            return cv2.TrackerCSRT_create()
+        elif tracker_type == "KCF":
+            return cv2.legacy.TrackerKCF_create()
+        elif tracker_type == "MOSSE":
+            return cv2.legacy.TrackerMOSSE_create()
+        elif tracker_type == "MIL":
+            return cv2.legacy.TrackerMIL_create()
+        else:
+            return cv2.TrackerCSRT_create()
+
+    def handle_key(self, key):
+        """
+        Handle keyboard input EXACTLY as original (lines 333-366).
+        Returns True if should continue, False if should exit.
+        """
+        if key == 27:  # ESC
+            return False
+
+        elif key == ord(' '):  # SPACE - Toggle auto-tracking (lines 275-291)
+            self.toggle_auto_tracking()
+
+        elif key == ord('r') or key == ord('R'):  # R - handled externally (needs UI)
+            pass  # UI will call reinitialize() with new bbox
+
+        elif key == ord('d') or key == ord('D'):  # D - Forward 10 frames (line 334-336)
+            self.auto_tracking = False
+            self.current_frame = min(self.current_frame + 10, self.total_frames - 1)
+
+        elif key == ord('a') or key == ord('A'):  # A - Backward 10 frames (line 338-340)
+            self.auto_tracking = False
+            self.current_frame = max(self.current_frame - 10, self.start_frame)
+
+        elif key == ord('w') or key == ord('W'):  # W - Forward 5s (line 343-347)
+            self.auto_tracking = False
+            jump_frames = int(5 * self.fps)
+            self.current_frame = min(self.current_frame + jump_frames, self.total_frames - 1)
+
+        elif key == ord('s') or key == ord('S'):  # S - Backward 5s (line 349-353)
+            self.auto_tracking = False
+            jump_frames = int(5 * self.fps)
+            self.current_frame = max(self.current_frame - jump_frames, self.start_frame)
+
+        return True
+
+    def toggle_auto_tracking(self):
+        """
+        Toggle auto-tracking EXACTLY as original (lines 275-291).
+        CRITICAL: Recreates tracker when resuming.
+
+        FIX: Use cached frame instead of seeking to avoid redundant decoder operations.
+        """
+        self.auto_tracking = not self.auto_tracking
+
+        if self.auto_tracking:
+            # Recreate tracker with last_bbox (lines 280-289)
+            if self.last_bbox is not None and self.cached_frame is not None:
+                # Use cached frame - no need to seek and read again
+                self.tracker = self._create_tracker(self.tracker_type)
+                self.tracker.init(self.cached_frame, self.last_bbox)
+
+    def reinitialize(self, bbox):
+        """
+        Reinitialize tracker EXACTLY as original (lines 307-329).
+        CRITICAL: Auto-resumes after reinitialization.
+
+        FIX: Use cached frame to avoid redundant seek and read.
+        """
+        # Use cached frame if available, otherwise read current frame
+        if self.cached_frame is not None:
+            frame = self.cached_frame
+            ok = True
+        else:
+            # Fallback: seek and read if no cache
+            try:
+                self.video.set(cv2.CAP_PROP_POS_FRAMES, self.current_frame)
+            except Exception as e:
+                print(f"Warning: Seek failed in reinitialize: {e}")
+                return False
+            ok, frame = self.video.read()
+
+        if ok and bbox is not None and bbox[2] > 0 and bbox[3] > 0:
+            # Create new tracker (lines 309-318)
+            self.tracker = self._create_tracker(self.tracker_type)
+            self.tracker.init(frame, bbox)
+            self.last_bbox = bbox
+            self.initial_area = bbox[2] * bbox[3]
+            self.size_history = [self.initial_area]
+
+            # Save reinitialization coordinates (lines 324-326)
+            x, y, w, h = [int(v) for v in bbox]
+            self.coords_dict[self.current_frame] = (self.current_frame, x, y, w, h)
+            self.last_tracked_frame = self.current_frame
+
+            # Auto-resume (line 329)
+            self.auto_tracking = True
+
+            return True
+        return False
+
+    def process_frame(self):
+        """
+        Process current frame EXACTLY as original (lines 144-374).
+        Returns dict with frame data for display.
+
+        OPTIMIZATION: Only seeks when frame is non-sequential.
+        This prevents FFmpeg async_lock errors from excessive seeking.
+        """
+        # CRITICAL FIX: Only seek if frame is non-sequential
+        # Sequential reads (N, N+1, N+2...) should NOT seek - just read()
+        # This eliminates 95% of seeks and prevents FFmpeg decoder race conditions
+        is_sequential = (self.current_frame == self.last_read_frame_number + 1)
+
+        if not is_sequential:
+            # Non-sequential access (jump, rewind, or first frame) - must seek
+            try:
+                self.video.set(cv2.CAP_PROP_POS_FRAMES, self.current_frame)
+            except Exception as e:
+                print(f"Warning: Seek to frame {self.current_frame} failed: {e}")
+                return None
+
+        # Read frame (sequential or after seek)
+        ok, frame = self.video.read()
+
+        if not ok:
+            return None
+
+        # Update position tracking
+        self.last_read_frame_number = self.current_frame
+        self.cached_frame = frame.copy()
+
+        # Determine if should track (lines 158-161)
+        should_track = self.auto_tracking and self.current_frame > self.last_tracked_frame
+
+        # Default color and status (lines 163-165)
+        color = (128, 128, 128)  # Gray for navigating
+        status = "NAVIGATING"
+        bbox = None
+
+        # Check if already tracked (lines 168-172)
+        if self.current_frame in self.coords_dict:
+            _, x, y, w, h = self.coords_dict[self.current_frame]
+            bbox = (x, y, w, h)
+            color = (0, 255, 0)  # Green
+            status = "TRACKED ✓"
+
+        # Track this frame (lines 174-217)
+        elif should_track and self.tracker:
+            ok, tracked_bbox = self.tracker.update(frame)
+
+            if ok:
+                x, y, w, h = [int(v) for v in tracked_bbox]
+                current_area = w * h
+                self.size_history.append(current_area)
+
+                # Keep only last 30 frames (lines 183-185)
+                if len(self.size_history) > 30:
+                    self.size_history.pop(0)
+
+                # Save coordinates (lines 187-190)
+                self.coords_dict[self.current_frame] = (self.current_frame, x, y, w, h)
+                self.last_tracked_frame = self.current_frame
+                self.last_bbox = tracked_bbox
+                bbox = (x, y, w, h)
+
+                # Detect problems (lines 192-209)
+                area_ratio = current_area / self.initial_area if self.initial_area > 0 else 1.0
+                recent_avg_area = sum(self.size_history) / len(self.size_history)
+                size_change = abs(current_area - recent_avg_area) / recent_avg_area if recent_avg_area > 0 else 0
+
+                color = (0, 255, 0)  # Green = OK
+                status = "TRACKING"
+
+                if area_ratio < 0.3:
+                    color = (0, 0, 255)  # Red
+                    status = "WARNING: Box too small!"
+                    self.lost_count += 1
+                elif area_ratio < 0.5:
+                    color = (0, 165, 255)  # Orange
+                    status = "ATTENTION: Box shrinking"
+                elif size_change > 0.2:
+                    color = (0, 165, 255)  # Orange
+                    status = "ATTENTION: Sudden change"
+            else:
+                # Tracking lost (lines 212-217)
+                self.lost_count += 1
+                color = (0, 0, 255)  # Red
+                status = "TRACKING LOST! Press R"
+                self.auto_tracking = False  # Auto-pause
+
+        # Show last bbox when navigating (lines 219-222)
+        elif self.last_bbox is not None:
+            bbox = tuple(int(v) for v in self.last_bbox)
+            color = (128, 128, 128)  # Gray
+            status = "NAVIGATING"
+
+        # Advance frame if auto-tracking (lines 369-373)
+        if self.auto_tracking:
+            self.current_frame += 1
+            if self.current_frame >= self.total_frames:
+                return None  # End of video
+
+        # Return frame data
+        return {
+            'frame': frame,
+            'frame_number': self.current_frame,
+            'bbox': bbox,
+            'color': color,
+            'status': status,
+            'mode': "AUTO" if self.auto_tracking else "MANUAL",
+            'tracked_frames': len(self.coords_dict),
+        }
+
+    def get_coords_dict(self):
+        """Return coordinates dictionary"""
+        return self.coords_dict
+
+    def close(self):
+        """Release video capture safely with decoder flush"""
+        if self.video:
+            # Flush decoder by seeking to start before releasing
+            # This prevents async_lock errors when closing during active decode
+            try:
+                self.video.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            except:
+                pass  # Ignore errors if video already closed or corrupted
+
+            self.video.release()
+            self.video = None
+
+            # Give decoder time to cleanup threads
+            cv2.waitKey(10)
+
+
 def select_and_track_improved(video_path, output_csv="coords.csv", start_time=0, tracker_type="CSRT"):
     """
     Tracking mejorado con navegación completa:
