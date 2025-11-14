@@ -3,3 +3,4 @@ numpy
 matplotlib
 PyQt5>=5.15.0
 Pillow>=10.0.0
+ultralytics>=8.3.0

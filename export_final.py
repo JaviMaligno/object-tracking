@@ -85,7 +85,7 @@ def interpolate_gaps(coords):
 
 
 def stabilize_and_smooth_coordinates(coords, smooth_window=15):
-    """Stabilise et lisse les coordonnées"""
+    """Stabilise et lisse les coordonnées avec rolling window pour TOUTES les dimensions"""
     if len(coords) < smooth_window:
         return coords
 
@@ -95,13 +95,9 @@ def stabilize_and_smooth_coordinates(coords, smooth_window=15):
     ws = [c[3] for c in coords]
     hs = [c[4] for c in coords]
 
-    # Taille médiane
-    median_w = int(np.median(ws))
-    median_h = int(np.median(hs))
+    print(f"   Applying rolling window smoothing (window={smooth_window}) to all dimensions...")
 
-    print(f"   Stabilizing size to median: {median_w}x{median_h}")
-
-    # Filtre médian pour outliers
+    # Filtre médian pour outliers sur X et Y
     xs_filtered = []
     ys_filtered = []
 
@@ -125,7 +121,35 @@ def stabilize_and_smooth_coordinates(coords, smooth_window=15):
         else:
             ys_filtered.append(ys[i])
 
-    # Lissage
+    # Filtre de outliers sur W et H usando percentiles para evitar spikes extremos
+    ws_filtered = []
+    hs_filtered = []
+
+    for i in range(len(ws)):
+        start = max(0, i - smooth_window // 2)
+        end = min(len(ws), i + smooth_window // 2 + 1)
+
+        window_ws = ws[start:end]
+        window_hs = hs[start:end]
+
+        # Usar percentil 75 como referencia para detectar outliers extremos
+        p75_w = np.percentile(window_ws, 75)
+        p75_h = np.percentile(window_hs, 75)
+        median_w = np.median(window_ws)
+        median_h = np.median(window_hs)
+
+        # Si el valor actual es más del 50% mayor que el percentil 75, usar la mediana
+        if ws[i] > p75_w * 1.5:
+            ws_filtered.append(median_w)
+        else:
+            ws_filtered.append(ws[i])
+
+        if hs[i] > p75_h * 1.5:
+            hs_filtered.append(median_h)
+        else:
+            hs_filtered.append(hs[i])
+
+    # Lissage con rolling mean para TODAS las dimensiones
     smoothed = []
     for i in range(len(frames)):
         start = max(0, i - smooth_window // 2)
@@ -133,8 +157,18 @@ def stabilize_and_smooth_coordinates(coords, smooth_window=15):
 
         avg_x = int(np.mean(xs_filtered[start:end]))
         avg_y = int(np.mean(ys_filtered[start:end]))
+        avg_w = int(np.mean(ws_filtered[start:end]))
+        avg_h = int(np.mean(hs_filtered[start:end]))
 
-        smoothed.append((frames[i], avg_x, avg_y, median_w, median_h))
+        smoothed.append((frames[i], avg_x, avg_y, avg_w, avg_h))
+
+    # Reportar estadísticas
+    min_w = min([s[3] for s in smoothed])
+    max_w = max([s[3] for s in smoothed])
+    min_h = min([s[4] for s in smoothed])
+    max_h = max([s[4] for s in smoothed])
+
+    print(f"   Size range after smoothing: W={min_w}-{max_w}, H={min_h}-{max_h}")
 
     return smoothed
 
@@ -214,13 +248,24 @@ def crop_and_export_fixed_ratio(video_path, coords_csv, output_path="output.mov"
     coords = stabilize_and_smooth_coordinates(coords, smooth_window)
     print()
 
-    # Calculer la taille de crop - SIMPLE
-    median_w = int(np.median([c[3] for c in coords]))
-    median_h = int(np.median([c[4] for c in coords]))
+    # Calculer la taille de crop usando percentil para evitar outliers extremos
+    # Usamos percentil 75 como base, que representa un tamaño típico-alto
+    # sin ser dominado por spikes extremos (que estarían en el 90-100 percentil)
+    ws_all = [c[3] for c in coords]
+    hs_all = [c[4] for c in coords]
+
+    p75_w = int(np.percentile(ws_all, 75))
+    p75_h = int(np.percentile(hs_all, 75))
+
+    print(f"   Size distribution:")
+    print(f"      50th percentile (median): {int(np.median(ws_all))}x{int(np.median(hs_all))}")
+    print(f"      75th percentile: {p75_w}x{p75_h}")
+    print(f"      90th percentile: {int(np.percentile(ws_all, 90))}x{int(np.percentile(hs_all, 90))}")
+    print(f"   Using 75th percentile as base for crop size")
 
     # Appliquer la marge
-    crop_w = int(median_w * margin_factor)
-    crop_h = int(median_h * margin_factor)
+    crop_w = int(p75_w * margin_factor)
+    crop_h = int(p75_h * margin_factor)
 
     # Limiter à la taille de la vidéo
     if crop_w > width:

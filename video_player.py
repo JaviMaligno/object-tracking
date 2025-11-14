@@ -27,6 +27,10 @@ class VideoPlayer(QWidget):
         self.is_playing = False
         self.playback_speed = 1.0
 
+        # External source mode - when True, VideoPlayer doesn't have its own VideoCapture
+        # Instead, it receives frames from tracking thread via display_external_frame()
+        self.external_source_mode = False
+
         # Tracking visualization
         self.bbox = None  # (x, y, w, h)
         self.bbox_color = QColor(0, 255, 0)  # Green by default
@@ -37,7 +41,8 @@ class VideoPlayer(QWidget):
         self.selection_end = None
 
         # Cache for current frame
-        self.current_image = None
+        self.current_image = None  # Frame WITH overlays (for display)
+        self.clean_frame = None    # Frame WITHOUT overlays (for redrawing)
 
         # UI Setup
         self.video_label = QLabel(self)
@@ -81,6 +86,66 @@ class VideoPlayer(QWidget):
         # Show first frame
         self.seek_frame(0)
         return True
+
+    def close_video(self):
+        """Close video capture and stop timers - ONLY if not in external source mode"""
+        # In external source mode, we don't have our own VideoCapture
+        if self.external_source_mode:
+            return
+
+        # Stop playback timer
+        if self.timer.isActive():
+            self.timer.stop()
+        self.is_playing = False
+
+        # Release video capture
+        if self.cap:
+            self.cap.release()
+            self.cap = None
+
+            # Force OpenCV to process events and fully release the file
+            # This is critical on Windows to avoid file locking issues
+            cv2.waitKey(1)
+
+    def display_external_frame(self, frame, frame_number):
+        """
+        Display frame from external source (e.g., TrackerCore).
+        Used when VideoPlayer's own capture is closed during tracking.
+        """
+        self.current_frame = frame_number
+        self._display_frame(frame)
+        self.frame_changed.emit(self.current_frame)
+
+    def set_external_source_mode(self, enabled):
+        """
+        Enable/disable external source mode.
+
+        When enabled:
+        - VideoPlayer closes its own VideoCapture (if any)
+        - VideoPlayer stops its playback timer
+        - VideoPlayer only displays frames received via display_external_frame()
+        - This prevents dual VideoCapture conflicts with tracking thread
+
+        When disabled:
+        - VideoPlayer can reopen its own VideoCapture via load_video()
+
+        Args:
+            enabled (bool): True to enable external source mode, False to disable
+        """
+        self.external_source_mode = enabled
+
+        if enabled:
+            # Close our own VideoCapture if it exists
+            if self.cap:
+                self.cap.release()
+                self.cap = None
+                cv2.waitKey(1)
+
+            # Stop playback timer
+            if self.timer.isActive():
+                self.timer.stop()
+            self.is_playing = False
+        # If disabled, the caller should call load_video() to reopen the video
 
     def get_video_info(self):
         """Return video information as dict"""
@@ -176,16 +241,16 @@ class VideoPlayer(QWidget):
         }
         self.bbox_color = color_map.get(color, QColor(0, 255, 0))
 
-        # Just redraw cached frame without seeking (prevents recursive seek and file contention)
-        if self.current_image is not None:
-            self._display_frame(self.current_image)
+        # Redraw from clean frame without seeking
+        if self.clean_frame is not None:
+            self._display_frame(self.clean_frame)
 
     def clear_bbox(self):
         """Clear bounding box"""
         self.bbox = None
-        # Just redraw cached frame without seeking (prevents recursive seek and file contention)
-        if self.current_image is not None:
-            self._display_frame(self.current_image)
+        # Redraw from clean frame without seeking
+        if self.clean_frame is not None:
+            self._display_frame(self.clean_frame)
 
     def start_selection(self):
         """Enable bbox selection mode"""
@@ -221,7 +286,10 @@ class VideoPlayer(QWidget):
         if frame is None:
             return
 
-        # Store original frame
+        # Store clean frame (without overlays) for redrawing
+        self.clean_frame = frame.copy()
+
+        # Create display frame with overlays
         display_frame = frame.copy()
 
         # Draw bounding box if present
@@ -274,15 +342,22 @@ class VideoPlayer(QWidget):
             self.selection_end = pos
 
     def _mouse_move(self, event):
-        """Handle mouse move for bbox selection"""
+        """
+        Handle mouse move for bbox selection
+
+        FIX: Remove seek_frame() call to prevent hundreds of seeks per second
+        to the same frame during bbox drawing. This was causing FFmpeg async_lock
+        errors when user draws selection at frame 750.
+        """
         if not self.selection_mode or not self.selection_start:
             return
 
         pos = self._widget_to_video_coords(event.pos())
         if pos:
             self.selection_end = pos
-            # Redraw with selection rectangle
-            self.seek_frame(self.current_frame)
+            # Redraw from CLEAN frame (without previous overlays) to avoid accumulation
+            if self.clean_frame is not None:
+                self._display_frame(self.clean_frame)
 
     def _mouse_release(self, event):
         """Handle mouse release for bbox selection"""
@@ -357,8 +432,22 @@ class VideoPlayer(QWidget):
         return self.current_image
 
     def closeEvent(self, event):
-        """Cleanup when widget is closed"""
+        """Cleanup when widget is closed - thread-safe"""
+        # Release video capture
         if self.cap:
             self.cap.release()
-        self.timer.stop()
+            self.cap = None
+            cv2.waitKey(1)
+
+        # Stop timer in thread-safe way
+        # QTimer can only be stopped from the thread that created it (main thread)
+        # Use QMetaObject.invokeMethod to ensure it's stopped in the correct thread
+        if self.timer and self.timer.isActive():
+            from PyQt5.QtCore import QMetaObject, Qt as QtCore
+            QMetaObject.invokeMethod(
+                self.timer,
+                "stop",
+                QtCore.QueuedConnection
+            )
+
         super().closeEvent(event)

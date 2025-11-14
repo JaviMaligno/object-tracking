@@ -38,7 +38,6 @@ class DancerTrackingUI(QMainWindow):
         self.tracking_thread = None
         self.export_thread = None
         self.tracking_active = False
-        self.last_resume_frame = None  # Track last frame where we resumed to avoid re-init
 
         # Setup UI
         self._setup_ui()
@@ -699,6 +698,16 @@ class DancerTrackingUI(QMainWindow):
             if self.tracking_thread.initial_bbox is None:
                 # First bbox selection - start thread (will be in paused state)
                 self.tracking_thread.set_initial_bbox(bbox)
+
+                # Show selected bbox on current frame
+                self.video_player.set_bbox(bbox, 'green')
+
+                # SOLUTION: Put VideoPlayer in external source mode
+                # This cleanly closes its VideoCapture WITHOUT file locking issues
+                # TrackerCore will be the ONLY VideoCapture for this file
+                self.video_player.set_external_source_mode(True)
+
+                # NO DELAY NEEDED - no dual VideoCapture conflict anymore
                 self.tracking_thread.start()  # Thread starts but is paused by default
                 self._log("Área seleccionada. Presiona Reanudar o Espacio para iniciar el tracking.")
                 # Update button state to show paused
@@ -706,30 +715,20 @@ class DancerTrackingUI(QMainWindow):
             else:
                 # Reinitialize bbox - stays paused
                 self.tracking_thread.set_reinitialize_bbox(bbox)
+                # Show new bbox on current frame
+                self.video_player.set_bbox(bbox, 'green')
                 self._log("Área re-seleccionada. Presiona Reanudar o Espacio para continuar.")
 
     def _pause_tracking(self):
-        """Pause/resume tracking"""
+        """Pause/resume tracking - forwards to TrackerCore"""
         if self.tracking_thread:
             if self.tracking_thread.is_paused:
-                # Resuming - sync frame position
-                current_video_frame = self.video_player.current_frame
-                self.tracking_thread.set_current_frame(current_video_frame)
-
-                # Only reinitialize if user navigated to a different frame
-                # (not on first resume right after bbox selection)
-                if self.last_resume_frame is not None and self.last_resume_frame != current_video_frame:
-                    # User navigated - tell thread to reinitialize when it resumes
-                    self.tracking_thread.needs_reinitialization = True
-                    self._log(f"Reanudando desde frame {current_video_frame} (reinicializando tracker)")
-                else:
-                    self.tracking_thread.needs_reinitialization = False
-                    self._log(f"Tracking reanudado desde frame {current_video_frame}")
-
-                self.last_resume_frame = current_video_frame
+                # Resuming - TrackerCore handles tracker recreation
                 self.tracking_thread.resume()
                 self.pause_tracking_btn.setText("⏸ Pausar (Espacio)")
+                self._log("Tracking reanudado (tracker recreado)")
             else:
+                # Pausing
                 self.tracking_thread.pause()
                 self.pause_tracking_btn.setText("▶ Reanudar")
                 self._log("Tracking pausado. Puedes navegar libremente con las flechas o botones.")
@@ -755,6 +754,13 @@ class DancerTrackingUI(QMainWindow):
             if self.tracking_thread.coords_dict:
                 self._save_coords_to_csv(self.tracking_thread.coords_dict)
 
+            # Restore VideoPlayer to normal mode (disable external source)
+            self.video_player.set_external_source_mode(False)
+
+            # Reopen VideoPlayer's own capture
+            if self.video_path:
+                self.video_player.load_video(self.video_path)
+
             self._reset_tracking_ui()
 
     def _on_tracking_progress(self, frame, total, status):
@@ -763,7 +769,7 @@ class DancerTrackingUI(QMainWindow):
         self.tracking_progress.setValue(progress)
         self._log(f"Frame {frame}/{total}: {status}", replace_last=True)
 
-    def _on_frame_tracked(self, frame_number, bbox, color):
+    def _on_frame_tracked(self, frame_number, bbox, color, frame_cv):
         """Handle frame tracked signal"""
         # Update timeline
         if color == 'green':
@@ -772,16 +778,17 @@ class DancerTrackingUI(QMainWindow):
             state = TimelineWidget.STATE_PROBLEM
         elif color == 'red':
             state = TimelineWidget.STATE_PROBLEM
+        elif color == 'gray':
+            state = TimelineWidget.STATE_TRACKED  # Gray = navigating
         else:
             state = TimelineWidget.STATE_TRACKED
 
         self.timeline.set_frame_state(frame_number, state)
 
-        # Only seek if frame is different from current (prevents redundant seek and file contention)
-        if frame_number != self.video_player.current_frame:
-            self.video_player.seek_frame(frame_number)
+        # Display frame from TrackerCore (VideoPlayer's capture is closed during tracking)
+        self.video_player.display_external_frame(frame_cv, frame_number)
 
-        # Update video player display with bbox (set_bbox now redraws without seeking)
+        # Update video player display with bbox
         if bbox:
             self.video_player.set_bbox(bbox, color)
         else:
@@ -800,18 +807,32 @@ class DancerTrackingUI(QMainWindow):
         # Enable export
         self.export_btn.setEnabled(True)
 
+        # Restore VideoPlayer to normal mode (disable external source)
+        self.video_player.set_external_source_mode(False)
+
+        # Reopen VideoPlayer's own capture
+        if self.video_path:
+            self.video_player.load_video(self.video_path)
+
         self._reset_tracking_ui()
 
     def _on_tracking_error(self, error_msg):
         """Handle tracking error"""
         self._log(f"Error en tracking: {error_msg}")
         QMessageBox.critical(self, "Error de Tracking", error_msg)
+
+        # Restore VideoPlayer to normal mode (disable external source)
+        self.video_player.set_external_source_mode(False)
+
+        # Reopen VideoPlayer's own capture
+        if self.video_path:
+            self.video_player.load_video(self.video_path)
+
         self._reset_tracking_ui()
 
     def _reset_tracking_ui(self):
         """Reset tracking UI to initial state"""
         self.tracking_active = False
-        self.last_resume_frame = None  # Reset resume tracking
         self.start_tracking_btn.setEnabled(True)
         self.pause_tracking_btn.setEnabled(False)
         self.reinit_btn.setEnabled(False)
@@ -927,7 +948,7 @@ class DancerTrackingUI(QMainWindow):
         )
 
     def keyPressEvent(self, event):
-        """Handle keyboard shortcuts"""
+        """Handle keyboard shortcuts - forwards to TrackerCore when tracking active"""
         if event.key() == Qt.Key_Space:
             # If tracking is active, pause/resume tracking
             # Otherwise, toggle video playback
@@ -943,22 +964,42 @@ class DancerTrackingUI(QMainWindow):
             self._reinitialize_tracking()
         elif event.key() == Qt.Key_Escape and self.tracking_active:
             self._stop_tracking()
-        elif event.key() == Qt.Key_Left:
-            self.video_player.prev_frame()
-        elif event.key() == Qt.Key_Right:
-            self.video_player.next_frame()
-        elif event.key() == Qt.Key_A:
-            # A = -10 frames (matching original track_improved.py)
-            self.video_player.seek_frame(self.video_player.current_frame - 10)
-        elif event.key() == Qt.Key_D:
-            # D = +10 frames (matching original track_improved.py)
-            self.video_player.seek_frame(self.video_player.current_frame + 10)
-        elif event.key() == Qt.Key_W:
-            # W = -5 seconds (matching original track_improved.py)
-            self.video_player.skip_seconds(-5)
-        elif event.key() == Qt.Key_S:
-            # S = +5 seconds (matching original track_improved.py)
-            self.video_player.skip_seconds(5)
+        elif event.key() in (Qt.Key_Left, Qt.Key_Right, Qt.Key_A, Qt.Key_D, Qt.Key_W, Qt.Key_S):
+            # CRITICAL: Forward navigation keys to TrackerCore when tracking is active
+            # This ensures original behavior: auto-pause, gray rectangle, etc.
+            if self.tracking_active and self.tracking_thread and self.tracking_thread.core:
+                # Convert Qt key to OpenCV key code for TrackerCore
+                key_map = {
+                    Qt.Key_Left: ord('a'),   # Arrow keys map to a/d for consistency
+                    Qt.Key_Right: ord('d'),
+                    Qt.Key_A: ord('a'),
+                    Qt.Key_D: ord('d'),
+                    Qt.Key_W: ord('w'),
+                    Qt.Key_S: ord('s')
+                }
+                cv_key = key_map.get(event.key())
+                if cv_key:
+                    # Forward to TrackerCore (original logic)
+                    self.tracking_thread.handle_key(cv_key)
+
+                    # Update UI to reflect auto-pause from navigation
+                    if self.tracking_thread.is_paused:
+                        self.pause_tracking_btn.setText("▶ Reanudar")
+                        self._log("Navegación: tracking pausado automáticamente", replace_last=False)
+            else:
+                # No tracking active - handle normally for video playback
+                if event.key() == Qt.Key_Left:
+                    self.video_player.prev_frame()
+                elif event.key() == Qt.Key_Right:
+                    self.video_player.next_frame()
+                elif event.key() == Qt.Key_A:
+                    self.video_player.seek_frame(self.video_player.current_frame - 10)
+                elif event.key() == Qt.Key_D:
+                    self.video_player.seek_frame(self.video_player.current_frame + 10)
+                elif event.key() == Qt.Key_W:
+                    self.video_player.skip_seconds(-5)
+                elif event.key() == Qt.Key_S:
+                    self.video_player.skip_seconds(5)
         else:
             super().keyPressEvent(event)
 

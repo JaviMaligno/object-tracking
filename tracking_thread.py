@@ -1,20 +1,26 @@
 """
 Tracking Thread for Dancer Tracking UI
 Runs tracking in background without blocking the UI
+
+ARCHITECTURE: This is a THIN WRAPPER around TrackerCore from track_improved.py.
+It bridges PyQt signals to the original tracking logic without reimplementing it.
 """
 
 import cv2
-import csv
 import time
+import numpy as np
 from PyQt5.QtCore import QThread, pyqtSignal
+
+# Import the original tracking logic
+from track_improved import TrackerCore
 
 
 class TrackingThread(QThread):
-    """Thread for running tracking in background"""
+    """Thread for running tracking in background using TrackerCore"""
 
-    # Signals
+    # Signals to communicate with UI
     progress_update = pyqtSignal(int, int, str)  # frame, total_frames, status_text
-    frame_tracked = pyqtSignal(int, tuple, str)  # frame_number, bbox (x,y,w,h), color ('green'|'orange'|'red')
+    frame_tracked = pyqtSignal(int, object, str, object)  # frame_number, bbox (x,y,w,h) or None, color, frame_cv
     tracking_complete = pyqtSignal(dict)  # coords_dict
     tracking_error = pyqtSignal(str)  # error_message
     request_bbox = pyqtSignal(int)  # Requests bbox selection for frame_number
@@ -25,85 +31,36 @@ class TrackingThread(QThread):
         self.tracker_type = tracker_type
         self.start_frame = start_frame
 
-        # Control flags
+        # Control flags for thread
         self.is_running = False
-        self.is_paused = False
         self.should_stop = False
         self.should_reinitialize = False
-        self.needs_reinitialization = False  # Flag for auto-reinit after navigation
 
-        # Tracking data
-        self.coords_dict = {}
+        # TrackerCore instance (created in run())
+        self.core = None
+
+        # Initial bbox (set by UI before starting)
         self.initial_bbox = None
-        self.current_bbox = None
-
-        # Video properties
-        self.cap = None
-        self.fps = 30
-        self.total_frames = 0
-        self.width = 0
-        self.height = 0
-
-        # Current state
-        self.current_frame = 0
-        self.tracker = None
+        self.reinitialize_bbox = None
 
     def set_initial_bbox(self, bbox):
         """Set the initial bounding box (x, y, w, h)"""
         self.initial_bbox = bbox
-        self.current_bbox = bbox
 
     def set_reinitialize_bbox(self, bbox):
         """Set bbox for reinitialization"""
-        self.current_bbox = bbox
-        self.should_reinitialize = False  # Reset flag
+        self.reinitialize_bbox = bbox
+        self.should_reinitialize = False
 
     def pause(self):
-        """Pause tracking"""
-        self.is_paused = True
+        """Pause tracking - forwards to TrackerCore"""
+        if self.core:
+            self.core.auto_tracking = False
 
     def resume(self):
-        """Resume tracking"""
-        self.is_paused = False
-
-    def set_current_frame(self, frame_number):
-        """Update current frame position (for manual navigation)"""
-        if 0 <= frame_number < self.total_frames:
-            self.current_frame = frame_number
-
-    def reinitialize_tracker_at_frame(self, bbox):
-        """
-        Reinitialize tracker at current frame with given bbox.
-        This is critical when resuming after manual navigation - reuses logic from track_improved.py.
-
-        Reads the frame at self.current_frame internally from video capture.
-
-        Args:
-            bbox: Bounding box tuple (x, y, w, h)
-
-        Returns:
-            bool: True if successful, False otherwise
-        """
-        if not self.cap or bbox is None:
-            return False
-
-        # Read frame at current position (reusing existing video capture)
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.current_frame)
-        ret, frame = self.cap.read()
-
-        if not ret:
-            return False
-
-        # Create new tracker (reusing existing _create_tracker method)
-        self.tracker = self._create_tracker(self.tracker_type)
-        if self.tracker is None:
-            return False
-
-        # Initialize with current frame and bbox
-        self.tracker.init(frame, bbox)
-        self.current_bbox = bbox
-
-        return True
+        """Resume tracking - forwards to TrackerCore"""
+        if self.core:
+            self.core.toggle_auto_tracking()
 
     def stop(self):
         """Stop tracking"""
@@ -112,84 +69,106 @@ class TrackingThread(QThread):
     def request_reinitialize(self):
         """Request tracker reinitialization"""
         self.should_reinitialize = True
-        self.is_paused = True
+        if self.core:
+            self.core.auto_tracking = False
+
+    def handle_key(self, key):
+        """Forward keyboard event to TrackerCore - THIS IS CRITICAL"""
+        if self.core:
+            self.core.handle_key(key)
+
+    def set_current_frame(self, frame_number):
+        """Update current frame position (for manual navigation)"""
+        if self.core:
+            self.core.current_frame = frame_number
+
+    @property
+    def is_paused(self):
+        """Check if tracking is paused"""
+        if self.core:
+            return not self.core.auto_tracking
+        return False
+
+    @property
+    def current_frame(self):
+        """Get current frame number"""
+        if self.core:
+            return self.core.current_frame
+        return 0
+
+    @property
+    def total_frames(self):
+        """Get total frame count"""
+        if self.core:
+            return self.core.total_frames
+        return 0
+
+    @property
+    def coords_dict(self):
+        """Get coordinates dictionary"""
+        if self.core:
+            return self.core.coords_dict
+        return {}
 
     def run(self):
-        """Main tracking loop - runs in background thread"""
+        """Main tracking loop - thin wrapper around TrackerCore"""
         try:
             self.is_running = True
             self.should_stop = False
 
-            # Open video
-            self.cap = cv2.VideoCapture(self.video_path)
-            if not self.cap.isOpened():
+            # Create TrackerCore instance with original logic
+            self.core = TrackerCore(
+                video_path=self.video_path,
+                tracker_type=self.tracker_type,
+                start_frame=self.start_frame
+            )
+
+            # Open video using original logic
+            if not self.core.open_video():
                 self.tracking_error.emit("Cannot open video file")
-                return
-
-            # Get video properties
-            self.fps = self.cap.get(cv2.CAP_PROP_FPS)
-            self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-            # Seek to start frame
-            self.current_frame = self.start_frame
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.current_frame)
-
-            # Read first frame
-            ret, frame = self.cap.read()
-            if not ret:
-                self.tracking_error.emit("Cannot read video frames")
                 return
 
             # Wait for initial bbox if not set
             if self.initial_bbox is None:
-                self.request_bbox.emit(self.current_frame)
-                # Wait for bbox to be set
+                self.request_bbox.emit(self.core.current_frame)
                 while self.initial_bbox is None and not self.should_stop:
                     time.sleep(0.1)
 
             if self.should_stop:
                 return
 
-            # Create tracker
-            self.tracker = self._create_tracker(self.tracker_type)
-            if self.tracker is None:
+            # Initialize tracker using original logic (reads frame internally)
+            if not self.core.initialize_tracker(self.initial_bbox):
                 self.tracking_error.emit(f"Failed to create {self.tracker_type} tracker")
                 return
 
-            # Initialize tracker
-            x, y, w, h = self.initial_bbox
-            self.tracker.init(frame, (x, y, w, h))
-            initial_area = w * h
+            # CRITICAL: Show the initialized frame immediately (matches original behavior)
+            # In the original, after tracker.init(), the loop reads the current frame again
+            # and displays it. We need to replicate this.
+            self.core.video.set(cv2.CAP_PROP_POS_FRAMES, self.core.current_frame)
+            ok, frame = self.core.video.read()
+            if ok:
+                # The bbox was just initialized, show it with green color
+                # initial_bbox is (x, y, w, h) - 4 values
+                x, y, w, h = self.initial_bbox
+                bbox = (int(x), int(y), int(w), int(h))
+                frame_copy = frame.copy()
+                self.frame_tracked.emit(self.core.current_frame, bbox, 'green', frame_copy)
 
-            # Save first frame
-            self.coords_dict[self.current_frame] = (self.current_frame, x, y, w, h)
-            self.frame_tracked.emit(self.current_frame, (x, y, w, h), 'green')
+            self.progress_update.emit(self.core.current_frame, self.core.total_frames, "Initialized - Press Resume/Space to start")
 
-            # Statistics
-            size_history = [initial_area]
-            last_tracked_frame = self.current_frame
+            # Start in PAUSED state - user must manually resume (same as original)
+            self.core.auto_tracking = False
 
-            # Start in PAUSED state - user must manually resume
-            self.is_paused = True
-
-            # Main tracking loop
-            self.current_frame += 1
-
-            # UI update throttling: update display every N frames (for performance)
-            ui_update_interval = 3  # Update UI every 3 frames (~10 fps for 30fps video)
-            frames_since_ui_update = 0
-
-            while self.current_frame < self.total_frames and not self.should_stop:
-                # Handle pause
-                while self.is_paused and not self.should_stop:
+            # Main tracking loop - use original logic
+            while self.core.current_frame < self.core.total_frames and not self.should_stop:
+                # Handle pause (wait while not auto_tracking)
+                while not self.core.auto_tracking and not self.should_stop:
                     time.sleep(0.1)
 
                     # Handle manual reinitialization (user pressed R)
                     if self.should_reinitialize:
-                        # Emit signal to request new bbox
-                        self.request_bbox.emit(self.current_frame)
+                        self.request_bbox.emit(self.core.current_frame)
 
                         # Wait for bbox to be set
                         while self.should_reinitialize and not self.should_stop:
@@ -198,177 +177,109 @@ class TrackingThread(QThread):
                         if self.should_stop:
                             break
 
-                        # Read current frame
-                        self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.current_frame)
-                        ret, frame = self.cap.read()
+                        # Reinitialize using original logic
+                        # CRITICAL: Must show the reinitialized frame BEFORE auto-tracking resumes
+                        # This matches original behavior where loop shows current frame after reinit
+                        if self.reinitialize_bbox:
+                            if self.core.reinitialize(self.reinitialize_bbox):
+                                # Read the frame we just reinitialized on
+                                self.core.video.set(cv2.CAP_PROP_POS_FRAMES, self.core.current_frame)
+                                ok, frame = self.core.video.read()
 
-                        if ret and self.current_bbox:
-                            # Reinitialize tracker
-                            self.tracker = self._create_tracker(self.tracker_type)
-                            x, y, w, h = self.current_bbox
-                            self.tracker.init(frame, (x, y, w, h))
+                                if ok and self.core.current_frame in self.core.coords_dict:
+                                    # Get the bbox we just saved in coords_dict
+                                    _, x, y, w, h = self.core.coords_dict[self.core.current_frame]
+                                    bbox = (int(x), int(y), int(w), int(h))
 
-                            # Save coordinates
-                            self.coords_dict[self.current_frame] = (self.current_frame, x, y, w, h)
-                            self.frame_tracked.emit(self.current_frame, (x, y, w, h), 'green')
+                                    # Emit the reinitialized frame with green bbox
+                                    frame_copy = frame.copy()
+                                    self.frame_tracked.emit(self.core.current_frame, bbox, 'green', frame_copy)
 
-                            last_tracked_frame = self.current_frame
-                            size_history = [w * h]
-                            frames_since_ui_update = 0
-
-                        # DO NOT resume automatically - stay paused
-                        # User must manually resume by pressing spacebar or resume button
-                        # self.is_paused = False  # Removed - stays paused
+                                self.progress_update.emit(
+                                    self.core.current_frame,
+                                    self.core.total_frames,
+                                    "Reinitialized - Resuming"
+                                )
 
                 if self.should_stop:
                     break
 
-                # Handle automatic reinitialization after navigation (thread-safe)
-                if self.needs_reinitialization:
-                    # Find last known bbox
-                    reinit_bbox = self.current_bbox
-                    if reinit_bbox is None:
-                        # Try to find from coords_dict
-                        for frame in range(self.current_frame, -1, -1):
-                            if frame in self.coords_dict:
-                                _, x, y, w, h = self.coords_dict[frame]
-                                reinit_bbox = (x, y, w, h)
-                                break
+                # Process frame using ORIGINAL LOGIC from TrackerCore
+                result = self.core.process_frame()
 
-                    if reinit_bbox:
-                        # Read current frame
-                        self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.current_frame)
-                        ret, frame = self.cap.read()
-
-                        if ret:
-                            # Create new tracker (like track_improved.py does)
-                            self.tracker = self._create_tracker(self.tracker_type)
-                            if self.tracker:
-                                x, y, w, h = reinit_bbox
-                                self.tracker.init(frame, (x, y, w, h))
-                                self.current_bbox = reinit_bbox
-
-                                # Update statistics
-                                initial_area = w * h
-                                size_history = [initial_area]
-
-                    self.needs_reinitialization = False
-
-                # Read frame at current position
-                self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.current_frame)
-                ret, frame = self.cap.read()
-                if not ret:
+                if result is None:
+                    # Video ended
                     break
 
-                # Check if we already have coords for this frame (skip tracking)
-                if self.current_frame in self.coords_dict:
-                    # Frame already tracked - skip and move to next
-                    self.current_frame += 1
-                    continue
+                # Emit signals based on result
+                frame_cv = result['frame']  # OpenCV frame (BGR numpy array)
+                frame_number = result['frame_number']
+                bbox = result['bbox']
+                color_bgr = result['color']  # BGR tuple from OpenCV
+                status = result['status']
+                mode = result['mode']
 
-                # Update tracker
-                ok, bbox = self.tracker.update(frame)
-
-                if ok:
-                    x, y, w, h = [int(v) for v in bbox]
-                    current_area = w * h
-                    size_history.append(current_area)
-
-                    # Keep only last 30 frames
-                    if len(size_history) > 30:
-                        size_history.pop(0)
-
-                    # Save coordinates
-                    self.coords_dict[self.current_frame] = (self.current_frame, x, y, w, h)
-                    self.current_bbox = (x, y, w, h)
-                    last_tracked_frame = self.current_frame
-
-                    # Detect problems
-                    area_ratio = current_area / initial_area
-                    recent_avg_area = sum(size_history) / len(size_history)
-                    size_change = abs(current_area - recent_avg_area) / recent_avg_area if recent_avg_area > 0 else 0
-
-                    # Determine color based on tracking quality
+                # Convert BGR color to string for UI
+                if color_bgr == (0, 255, 0):  # Green
                     color = 'green'
-                    status = "Tracking OK"
-
-                    if area_ratio < 0.3:
-                        color = 'red'
-                        status = "WARNING: Box too small!"
-                    elif area_ratio < 0.5:
-                        color = 'orange'
-                        status = "ATTENTION: Box shrinking"
-                    elif size_change > 0.2:
-                        color = 'orange'
-                        status = "ATTENTION: Sudden change"
-
-                    # Emit progress (always emit progress_update for progress bar)
-                    self.progress_update.emit(self.current_frame, self.total_frames, status)
-
-                    # Throttle UI updates: only emit frame_tracked every N frames
-                    frames_since_ui_update += 1
-                    if frames_since_ui_update >= ui_update_interval:
-                        self.frame_tracked.emit(self.current_frame, (x, y, w, h), color)
-                        frames_since_ui_update = 0
-
+                elif color_bgr == (0, 165, 255):  # Orange
+                    color = 'orange'
+                elif color_bgr == (0, 0, 255):  # Red
+                    color = 'red'
+                elif color_bgr == (128, 128, 128):  # Gray
+                    color = 'gray'
                 else:
-                    # Tracking lost - always show immediately
-                    self.frame_tracked.emit(self.current_frame, None, 'red')
-                    self.progress_update.emit(self.current_frame, self.total_frames, "TRACKING LOST!")
+                    color = 'green'
 
-                    # Pause and wait for user to reinitialize
-                    self.is_paused = True
-                    frames_since_ui_update = 0
+                # Update progress
+                self.progress_update.emit(frame_number, self.core.total_frames, status)
 
-                # Move to next frame
-                self.current_frame += 1
+                # Copy frame to avoid threading issues with numpy arrays
+                # Qt signals serialize data, so we need to ensure frame is independent
+                frame_copy = frame_cv.copy()
 
-                # Small delay to not overwhelm the UI
-                time.sleep(0.001)
+                # Emit frame tracking result WITH frame data for display
+                if bbox:
+                    self.frame_tracked.emit(frame_number, bbox, color, frame_copy)
+                else:
+                    # Tracking lost
+                    self.frame_tracked.emit(frame_number, None, 'red', frame_copy)
 
-            # Save to CSV
-            if self.coords_dict and not self.should_stop:
-                self.tracking_complete.emit(self.coords_dict)
+                # Small delay to not overwhelm the UI and FFmpeg decoder
+                # 20ms gives FFmpeg decoder sufficient time to process frames
+                # Combined with sequential read optimization in process_frame(),
+                # this ensures stable operation without async_lock errors
+                time.sleep(0.02)
+
+            # Complete tracking
+            if self.core.coords_dict and not self.should_stop:
+                self.tracking_complete.emit(self.core.coords_dict)
             else:
                 self.tracking_error.emit("Tracking stopped by user")
 
         except Exception as e:
-            self.tracking_error.emit(f"Tracking error: {str(e)}")
+            import traceback
+            self.tracking_error.emit(f"Tracking error: {str(e)}\n{traceback.format_exc()}")
 
         finally:
-            if self.cap:
-                self.cap.release()
+            if self.core:
+                self.core.close()
             self.is_running = False
-
-    def _create_tracker(self, tracker_type):
-        """Create OpenCV tracker based on type"""
-        try:
-            if tracker_type == "CSRT":
-                return cv2.TrackerCSRT_create()
-            elif tracker_type == "KCF":
-                return cv2.legacy.TrackerKCF_create()
-            elif tracker_type == "MOSSE":
-                return cv2.legacy.TrackerMOSSE_create()
-            elif tracker_type == "MIL":
-                return cv2.legacy.TrackerMIL_create()
-            else:
-                return cv2.TrackerCSRT_create()
-        except Exception as e:
-            print(f"Error creating tracker: {e}")
-            return None
 
     def save_to_csv(self, output_path):
         """Save tracking coordinates to CSV file"""
-        try:
-            # Sort frames
-            sorted_frames = sorted(self.coords_dict.keys())
+        if not self.core or not self.core.coords_dict:
+            return False
 
+        try:
+            import csv
+            sorted_frames = sorted(self.core.coords_dict.keys())
             with open(output_path, 'w', newline='') as f:
                 writer = csv.writer(f)
                 writer.writerow(['frame', 'x', 'y', 'w', 'h'])
 
                 for frame_num in sorted_frames:
-                    frame, x, y, w, h = self.coords_dict[frame_num]
+                    frame, x, y, w, h = self.core.coords_dict[frame_num]
                     writer.writerow([frame, x, y, w, h])
 
             return True
