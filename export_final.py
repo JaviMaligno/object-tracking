@@ -272,6 +272,128 @@ def stabilize_and_smooth_coordinates(coords, smooth_window=15):
     return smoothed
 
 
+def parse_aspect_ratio(aspect_ratio_str):
+    """
+    Parse aspect ratio string and return (width, height, ratio_value)
+
+    Returns:
+        tuple: (target_width, target_height, ratio) or None if 'auto'
+    """
+    if aspect_ratio_str is None or aspect_ratio_str.lower() == 'auto':
+        return None
+
+    # Instagram presets
+    if aspect_ratio_str.lower() in ['instagram', '4:5']:
+        return (1080, 1350, 0.8)  # 4:5 portrait
+
+    if aspect_ratio_str.lower() in ['square', '1:1']:
+        return (1080, 1080, 1.0)  # Square
+
+    if aspect_ratio_str.lower() in ['9:16', 'iphone']:
+        return (1080, 1920, 0.5625)  # Vertical iPhone
+
+    if aspect_ratio_str.lower() in ['16:9', 'landscape']:
+        return (1920, 1080, 1.777)  # Landscape
+
+    # Parse custom ratio like "4:5" or "16:9"
+    if ':' in aspect_ratio_str:
+        try:
+            w_ratio, h_ratio = map(int, aspect_ratio_str.split(':'))
+            ratio = w_ratio / h_ratio
+            # Calculate dimensions maintaining ~1080p quality
+            if ratio < 1:  # Portrait
+                height = 1350
+                width = int(height * ratio)
+            else:  # Landscape
+                width = 1920
+                height = int(width / ratio)
+            return (width, height, ratio)
+        except:
+            print(f"WARNING: Invalid aspect ratio '{aspect_ratio_str}', using auto")
+            return None
+
+    print(f"WARNING: Unknown aspect ratio '{aspect_ratio_str}', using auto")
+    return None
+
+
+def calculate_adaptive_crop(x, y, w, h, target_ratio, video_width, video_height, margin_factor=1.5, min_width=1080, min_height=1350):
+    """
+    Calculate ADAPTIVE crop that maintains aspect ratio but adjusts size to fit dancer
+    Prevents cutting off dancers by zooming out when they're close to camera
+
+    Args:
+        x, y, w, h: Dancer bounding box
+        target_ratio: Target aspect ratio (e.g., 0.8 for 4:5)
+        video_width, video_height: Original video dimensions
+        margin_factor: Margin around dancer
+        min_width, min_height: Minimum crop dimensions (for quality)
+
+    Returns:
+        crop_x, crop_y, crop_w, crop_h: Adaptive crop coordinates
+    """
+    # Required size with margin
+    required_w = int(w * margin_factor)
+    required_h = int(h * margin_factor)
+
+    # Ensure minimum dimensions for quality
+    required_w = max(required_w, min_width)
+    required_h = max(required_h, min_height)
+
+    # Calculate crop maintaining target ratio but large enough to fit dancer
+    if required_w / required_h > target_ratio:
+        # Width is limiting factor
+        crop_w = required_w
+        crop_h = int(crop_w / target_ratio)
+    else:
+        # Height is limiting factor (most common for close-ups)
+        crop_h = required_h
+        crop_w = int(crop_h * target_ratio)
+
+    # Limit to video dimensions
+    if crop_w > video_width:
+        crop_w = video_width
+        crop_h = int(crop_w / target_ratio)
+    if crop_h > video_height:
+        crop_h = video_height
+        crop_w = int(crop_h * target_ratio)
+
+    # Final check to ensure we don't exceed video bounds
+    crop_w = min(crop_w, video_width)
+    crop_h = min(crop_h, video_height)
+
+    # Recalculate to maintain exact ratio after limiting
+    actual_ratio = crop_w / crop_h
+    if abs(actual_ratio - target_ratio) > 0.01:  # Allow small tolerance
+        if crop_w == video_width:
+            # Width is maxed out, adjust height
+            crop_h = int(crop_w / target_ratio)
+            if crop_h > video_height:
+                crop_h = video_height
+        else:
+            # Height is maxed out, adjust width
+            crop_w = int(crop_h * target_ratio)
+            if crop_w > video_width:
+                crop_w = video_width
+
+    # Center on dancer
+    center_x = x + w // 2
+    center_y = y + h // 2
+    crop_x = center_x - crop_w // 2
+    crop_y = center_y - crop_h // 2
+
+    # Adjust if out of bounds
+    if crop_x < 0:
+        crop_x = 0
+    if crop_y < 0:
+        crop_y = 0
+    if crop_x + crop_w > video_width:
+        crop_x = video_width - crop_w
+    if crop_y + crop_h > video_height:
+        crop_y = video_height - crop_h
+
+    return crop_x, crop_y, crop_w, crop_h
+
+
 def calculate_fixed_crop(x, y, w, h, target_w, target_h, video_width, video_height):
     """
     Calcule un crop de taille EXACTE avec le bon ratio
@@ -298,10 +420,49 @@ def calculate_fixed_crop(x, y, w, h, target_w, target_h, video_width, video_heig
     return crop_x, crop_y, target_w, target_h
 
 
+def smooth_crop_sizes(crop_sizes, smooth_window=30):
+    """
+    Smooth crop size changes using EMA to prevent abrupt zoom transitions
+
+    Args:
+        crop_sizes: List of (crop_w, crop_h) tuples
+        smooth_window: Window size for smoothing
+
+    Returns:
+        List of smoothed (crop_w, crop_h) tuples
+    """
+    if len(crop_sizes) < 2:
+        return crop_sizes
+
+    # Calculate EMA alpha
+    alpha = 2.0 / (smooth_window + 1)
+
+    smoothed = []
+    ema_w = crop_sizes[0][0]
+    ema_h = crop_sizes[0][1]
+
+    for crop_w, crop_h in crop_sizes:
+        # Apply EMA smoothing
+        ema_w = alpha * crop_w + (1 - alpha) * ema_w
+        ema_h = alpha * crop_h + (1 - alpha) * ema_h
+
+        smoothed.append((int(ema_w), int(ema_h)))
+
+    return smoothed
+
+
 def crop_and_export_fixed_ratio(video_path, coords_csv, output_path="output.mov",
-                                margin_factor=1.5, smooth_window=15):
+                                margin_factor=1.5, smooth_window=15, aspect_ratio=None, adaptive_crop=False):
     """
     Export avec ratio FIXE - pas de déformation
+
+    Args:
+        aspect_ratio: Target aspect ratio as string:
+            - 'instagram' or '4:5': 1080x1350 (0.8 ratio)
+            - 'square' or '1:1': 1080x1080 (1.0 ratio)
+            - '9:16': 1080x1920 (0.5625 ratio, iPhone vertical)
+            - 'auto' or None: Automatic based on tracking (default)
+        adaptive_crop: If True, crop size adapts to dancer size (prevents cut-offs)
     """
 
     if not os.path.exists(video_path):
@@ -347,36 +508,120 @@ def crop_and_export_fixed_ratio(video_path, coords_csv, output_path="output.mov"
     coords = stabilize_and_smooth_coordinates_ema(coords, smooth_window)
     print()
 
-    # Calculer la taille de crop usando percentil para evitar outliers extremos
-    # Usamos percentil 75 como base, que representa un tamaño típico-alto
-    # sin ser dominado por spikes extremos (que estarían en el 90-100 percentil)
-    ws_all = [c[3] for c in coords]
-    hs_all = [c[4] for c in coords]
+    # Parse aspect ratio
+    aspect_info = parse_aspect_ratio(aspect_ratio)
 
-    p75_w = int(np.percentile(ws_all, 75))
-    p75_h = int(np.percentile(hs_all, 75))
+    # Variables for adaptive mode
+    use_adaptive = False
+    adaptive_crop_sizes = None
 
-    print(f"   Size distribution:")
-    print(f"      50th percentile (median): {int(np.median(ws_all))}x{int(np.median(hs_all))}")
-    print(f"      75th percentile: {p75_w}x{p75_h}")
-    print(f"      90th percentile: {int(np.percentile(ws_all, 90))}x{int(np.percentile(hs_all, 90))}")
-    print(f"   Using 75th percentile as base for crop size")
+    if aspect_info is not None:
+        # Fixed aspect ratio mode
+        target_w, target_h, target_ratio = aspect_info
 
-    # Appliquer la marge
-    crop_w = int(p75_w * margin_factor)
-    crop_h = int(p75_h * margin_factor)
+        # Determine if using adaptive mode
+        if adaptive_crop:
+            print(f"Using ADAPTIVE aspect ratio: {aspect_ratio} (prevents cut-offs)")
+            use_adaptive = True
+        else:
+            print(f"Using FIXED aspect ratio: {aspect_ratio}")
 
-    # Limiter à la taille de la vidéo
-    if crop_w > width:
-        crop_w = width
-    if crop_h > height:
-        crop_h = height
+        print(f"   Target dimensions: {target_w}x{target_h}")
+        print(f"   Target ratio: {target_ratio:.3f}")
 
-    # Calculer le ratio pour information
-    final_ratio = crop_w / crop_h
+        # Ensure dimensions fit within video
+        if target_w > width or target_h > height:
+            # Scale down to fit
+            scale = min(width / target_w, height / target_h)
+            target_w = int(target_w * scale)
+            target_h = int(target_h * scale)
+            print(f"   Scaled to fit video: {target_w}x{target_h}")
+
+        if use_adaptive:
+            # Pre-calculate adaptive crop sizes for all frames
+            print("   Calculating adaptive crop sizes...")
+            raw_crop_sizes = []
+
+            for frame_num, x, y, w, h in coords:
+                _, _, adaptive_w, adaptive_h = calculate_adaptive_crop(
+                    x, y, w, h, target_ratio, width, height, margin_factor, target_w, target_h
+                )
+                raw_crop_sizes.append((adaptive_w, adaptive_h))
+
+            # Smooth crop sizes to prevent abrupt zoom changes
+            print(f"   Smoothing crop size transitions (window={smooth_window})...")
+            smoothed_sizes = smooth_crop_sizes(raw_crop_sizes, smooth_window)
+
+            # Create dict mapping frame number to crop size
+            adaptive_crop_sizes = {}
+            for i, (frame_num, x, y, w, h) in enumerate(coords):
+                adaptive_crop_sizes[frame_num] = smoothed_sizes[i]
+
+            # Report stats
+            min_w = min(s[0] for s in smoothed_sizes)
+            max_w = max(s[0] for s in smoothed_sizes)
+            min_h = min(s[1] for s in smoothed_sizes)
+            max_h = max(s[1] for s in smoothed_sizes)
+            print(f"   Adaptive crop range: {min_w}x{min_h} to {max_w}x{max_h}")
+            print(f"   All frames will be resized to {target_w}x{target_h} at end")
+
+            crop_w = target_w  # For video writer creation
+            crop_h = target_h
+            final_ratio = target_ratio  # Use target ratio for adaptive mode
+        else:
+            # Fixed size mode (original behavior)
+            crop_w = target_w
+            crop_h = target_h
+            final_ratio = crop_w / crop_h
+
+            # Check if tracked dancers fit in the target dimensions
+            ws_all = [c[3] for c in coords]
+            hs_all = [c[4] for c in coords]
+            p75_w = int(np.percentile(ws_all, 75))
+            p75_h = int(np.percentile(hs_all, 75))
+            required_w = int(p75_w * margin_factor)
+            required_h = int(p75_h * margin_factor)
+
+            print(f"   Tracked dancer size (75th percentile + margin): {required_w}x{required_h}")
+
+            if required_w > crop_w or required_h > crop_h:
+                print(f"   WARNING: Dancers might be too large for target aspect ratio!")
+                print(f"   Consider using --adaptive-crop flag or --margin {margin_factor * 0.8:.1f}")
+
+    else:
+        # Automatic mode - calculate from tracking
+        print("Using AUTOMATIC aspect ratio based on tracking")
+
+        # Calculer la taille de crop usando percentil para evitar outliers extremos
+        # Usamos percentil 75 como base, que representa un tamaño típico-alto
+        # sin ser dominado por spikes extremos (que estarían en el 90-100 percentil)
+        ws_all = [c[3] for c in coords]
+        hs_all = [c[4] for c in coords]
+
+        p75_w = int(np.percentile(ws_all, 75))
+        p75_h = int(np.percentile(hs_all, 75))
+
+        print(f"   Size distribution:")
+        print(f"      50th percentile (median): {int(np.median(ws_all))}x{int(np.median(hs_all))}")
+        print(f"      75th percentile: {p75_w}x{p75_h}")
+        print(f"      90th percentile: {int(np.percentile(ws_all, 90))}x{int(np.percentile(hs_all, 90))}")
+        print(f"   Using 75th percentile as base for crop size")
+
+        # Appliquer la marge
+        crop_w = int(p75_w * margin_factor)
+        crop_h = int(p75_h * margin_factor)
+
+        # Limiter à la taille de la vidéo
+        if crop_w > width:
+            crop_w = width
+        if crop_h > height:
+            crop_h = height
+
+        # Calculer le ratio pour information
+        final_ratio = crop_w / crop_h
 
     print(f"Final crop size: {crop_w}x{crop_h}")
-    print(f"Final aspect ratio: {final_ratio:.2f} (original: {original_ratio:.2f})")
+    print(f"Final aspect ratio: {final_ratio:.3f} (original: {original_ratio:.2f})")
     print()
 
     # Dictionnaire
@@ -404,7 +649,10 @@ def crop_and_export_fixed_ratio(video_path, coords_csv, output_path="output.mov"
         video.release()
         sys.exit(1)
 
-    print("Processing video with FIXED ASPECT RATIO...")
+    if use_adaptive:
+        print("Processing video with ADAPTIVE ASPECT RATIO (zoom adjusts to fit dancers)...")
+    else:
+        print("Processing video with FIXED ASPECT RATIO...")
     print()
 
     video.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -423,20 +671,40 @@ def crop_and_export_fixed_ratio(video_path, coords_csv, output_path="output.mov"
         # Position du crop
         if frame_count in coords_dict:
             _, x, y, w, h = coords_dict[frame_count]
-            crop_x, crop_y, crop_w_frame, crop_h_frame = calculate_fixed_crop(
-                x, y, w, h, crop_w, crop_h, width, height
-            )
+
+            if use_adaptive and frame_count in adaptive_crop_sizes:
+                # Adaptive mode: use pre-calculated crop size for this frame
+                adaptive_w, adaptive_h = adaptive_crop_sizes[frame_count]
+                crop_x, crop_y, crop_w_frame, crop_h_frame = calculate_adaptive_crop(
+                    x, y, w, h, target_ratio, width, height, margin_factor, target_w, target_h
+                )
+                # Override the size from calculate_adaptive_crop with our smoothed size
+                crop_w_frame, crop_h_frame = adaptive_w, adaptive_h
+
+                # Recalculate position with new size
+                center_x = x + w // 2
+                center_y = y + h // 2
+                crop_x = center_x - crop_w_frame // 2
+                crop_y = center_y - crop_h_frame // 2
+
+                # Bounds checking
+                crop_x = max(0, min(crop_x, width - crop_w_frame))
+                crop_y = max(0, min(crop_y, height - crop_h_frame))
+            else:
+                # Fixed mode: use constant crop size
+                crop_x, crop_y, crop_w_frame, crop_h_frame = calculate_fixed_crop(
+                    x, y, w, h, crop_w, crop_h, width, height
+                )
+
             last_crop = (crop_x, crop_y, crop_w_frame, crop_h_frame)
         else:
             crop_x, crop_y, crop_w_frame, crop_h_frame = last_crop
 
-        # Crop - TOUJOURS la même taille exacte
+        # Crop
         cropped = frame[crop_y:crop_y+crop_h_frame, crop_x:crop_x+crop_w_frame]
 
-        # PAS de resize nécessaire - le crop est déjà à la bonne taille !
-        # Mais par sécurité, vérifier quand même
-        if cropped.shape[1] != crop_w or cropped.shape[0] != crop_h:
-            print(f"Warning at frame {frame_count}: crop size mismatch, resizing")
+        # Resize to target dimensions (important for adaptive mode)
+        if use_adaptive or cropped.shape[1] != crop_w or cropped.shape[0] != crop_h:
             cropped = cv2.resize(cropped, (crop_w, crop_h))
 
         out.write(cropped)
@@ -522,12 +790,25 @@ def crop_and_export_fixed_ratio(video_path, coords_csv, output_path="output.mov"
 
 def main():
     if len(sys.argv) < 3:
-        print("Usage: python crop_and_export_fixed_ratio.py <video> <coords.csv> [output.mov] [options]")
+        print("Usage: python export_final.py <video> <coords.csv> [output.mov] [options]")
         print("\nExample:")
-        print("  python crop_and_export_fixed_ratio.py video.mov coords.csv output.mov")
+        print("  python export_final.py video.mov coords.csv output.mov")
+        print("  python export_final.py video.mov coords.csv output.mov --aspect-ratio instagram --adaptive-crop")
         print("\nOptions:")
-        print("  --margin FACTOR    Margin factor (default: 1.5)")
-        print("  --smooth WINDOW    Smoothing window (default: 15)")
+        print("  --margin FACTOR         Margin factor (default: 1.5)")
+        print("  --smooth WINDOW         Smoothing window (default: 15)")
+        print("  --aspect-ratio RATIO    Target aspect ratio (default: auto)")
+        print("  --adaptive-crop         Enable adaptive zoom (prevents cut-offs, recommended for Instagram)")
+        print("\nAspect Ratio Presets:")
+        print("  instagram, 4:5          Instagram portrait (1080x1350)")
+        print("  square, 1:1             Square format (1080x1080)")
+        print("  9:16, iphone            Vertical iPhone (1080x1920)")
+        print("  16:9, landscape         Horizontal landscape (1920x1080)")
+        print("  auto                    Automatic based on tracking")
+        print("  X:Y                     Custom ratio (e.g., 3:4, 2:3)")
+        print("\nAdaptive Crop:")
+        print("  Without --adaptive-crop: Fixed crop size (may cut dancers when close)")
+        print("  With --adaptive-crop:    Zoom adjusts dynamically (never cuts, recommended)")
         sys.exit(1)
 
     video_path = sys.argv[1]
@@ -536,6 +817,8 @@ def main():
 
     margin_factor = 1.5
     smooth_window = 15
+    aspect_ratio = None
+    adaptive_crop = False
 
     i = 4
     while i < len(sys.argv):
@@ -545,11 +828,17 @@ def main():
         elif sys.argv[i] == '--smooth' and i + 1 < len(sys.argv):
             smooth_window = int(sys.argv[i + 1])
             i += 2
+        elif sys.argv[i] in ['--aspect-ratio', '--aspect', '--ratio'] and i + 1 < len(sys.argv):
+            aspect_ratio = sys.argv[i + 1]
+            i += 2
+        elif sys.argv[i] in ['--adaptive-crop', '--adaptive']:
+            adaptive_crop = True
+            i += 1
         else:
             i += 1
 
     crop_and_export_fixed_ratio(video_path, coords_csv, output_path,
-                                margin_factor, smooth_window)
+                                margin_factor, smooth_window, aspect_ratio, adaptive_crop)
 
 
 if __name__ == "__main__":

@@ -12,6 +12,125 @@ import tempfile
 from PyQt5.QtCore import QThread, pyqtSignal
 
 
+def parse_aspect_ratio(aspect_ratio_str):
+    """
+    Parse aspect ratio string and return (width, height, ratio_value)
+
+    Returns:
+        tuple: (target_width, target_height, ratio) or None if 'auto'
+    """
+    if aspect_ratio_str is None or aspect_ratio_str.lower() == 'auto':
+        return None
+
+    # Instagram presets
+    if aspect_ratio_str.lower() in ['instagram', '4:5']:
+        return (1080, 1350, 0.8)  # 4:5 portrait
+
+    if aspect_ratio_str.lower() in ['square', '1:1']:
+        return (1080, 1080, 1.0)  # Square
+
+    if aspect_ratio_str.lower() in ['9:16', 'iphone']:
+        return (1080, 1920, 0.5625)  # Vertical iPhone
+
+    if aspect_ratio_str.lower() in ['16:9', 'landscape']:
+        return (1920, 1080, 1.777)  # Landscape
+
+    # Parse custom ratio like "4:5" or "16:9"
+    if ':' in aspect_ratio_str:
+        try:
+            w_ratio, h_ratio = map(int, aspect_ratio_str.split(':'))
+            ratio = w_ratio / h_ratio
+            # Calculate dimensions maintaining ~1080p quality
+            if ratio < 1:  # Portrait
+                height = 1350
+                width = int(height * ratio)
+            else:  # Landscape
+                width = 1920
+                height = int(width / ratio)
+            return (width, height, ratio)
+        except:
+            return None
+
+    return None
+
+
+def calculate_adaptive_crop(x, y, w, h, target_ratio, video_width, video_height, margin_factor=1.5, min_width=1080, min_height=1350):
+    """
+    Calculate ADAPTIVE crop that maintains aspect ratio but adjusts size to fit dancer
+    (Same as in export_final.py)
+    """
+    required_w = int(w * margin_factor)
+    required_h = int(h * margin_factor)
+
+    required_w = max(required_w, min_width)
+    required_h = max(required_h, min_height)
+
+    if required_w / required_h > target_ratio:
+        crop_w = required_w
+        crop_h = int(crop_w / target_ratio)
+    else:
+        crop_h = required_h
+        crop_w = int(crop_h * target_ratio)
+
+    if crop_w > video_width:
+        crop_w = video_width
+        crop_h = int(crop_w / target_ratio)
+    if crop_h > video_height:
+        crop_h = video_height
+        crop_w = int(crop_h * target_ratio)
+
+    crop_w = min(crop_w, video_width)
+    crop_h = min(crop_h, video_height)
+
+    actual_ratio = crop_w / crop_h
+    if abs(actual_ratio - target_ratio) > 0.01:
+        if crop_w == video_width:
+            crop_h = int(crop_w / target_ratio)
+            if crop_h > video_height:
+                crop_h = video_height
+        else:
+            crop_w = int(crop_h * target_ratio)
+            if crop_w > video_width:
+                crop_w = video_width
+
+    center_x = x + w // 2
+    center_y = y + h // 2
+    crop_x = center_x - crop_w // 2
+    crop_y = center_y - crop_h // 2
+
+    if crop_x < 0:
+        crop_x = 0
+    if crop_y < 0:
+        crop_y = 0
+    if crop_x + crop_w > video_width:
+        crop_x = video_width - crop_w
+    if crop_y + crop_h > video_height:
+        crop_y = video_height - crop_h
+
+    return crop_x, crop_y, crop_w, crop_h
+
+
+def smooth_crop_sizes(crop_sizes, smooth_window=30):
+    """
+    Smooth crop size changes using EMA
+    (Same as in export_final.py)
+    """
+    if len(crop_sizes) < 2:
+        return crop_sizes
+
+    alpha = 2.0 / (smooth_window + 1)
+    smoothed = []
+    ema_w = crop_sizes[0][0]
+    ema_h = crop_sizes[0][1]
+
+    for crop_w, crop_h in crop_sizes:
+        ema_w = alpha * crop_w + (1 - alpha) * ema_w
+        ema_h = alpha * crop_h + (1 - alpha) * ema_h
+        smoothed.append((int(ema_w), int(ema_h)))
+
+    return smoothed
+
+
 class ExportThread(QThread):
     """Thread for running export in background"""
 
@@ -20,13 +139,15 @@ class ExportThread(QThread):
     export_complete = pyqtSignal(str)  # output_path
     export_error = pyqtSignal(str)  # error_message
 
-    def __init__(self, video_path, coords_csv, output_path, margin_factor=1.5, smooth_window=10):
+    def __init__(self, video_path, coords_csv, output_path, margin_factor=1.5, smooth_window=10, aspect_ratio=None, adaptive_crop=False):
         super().__init__()
         self.video_path = video_path
         self.coords_csv = coords_csv
         self.output_path = output_path
         self.margin_factor = margin_factor
         self.smooth_window = smooth_window
+        self.aspect_ratio = aspect_ratio
+        self.adaptive_crop = adaptive_crop
 
         # Control flags
         self.should_stop = False
@@ -80,16 +201,70 @@ class ExportThread(QThread):
             # Stabilize and smooth
             coords = self._stabilize_and_smooth(coords, self.smooth_window)
 
-            # Calculate fixed crop size
-            median_w = int(np.median([c[3] for c in coords]))
-            median_h = int(np.median([c[4] for c in coords]))
+            # Parse aspect ratio
+            aspect_info = parse_aspect_ratio(self.aspect_ratio)
 
-            crop_w = int(median_w * self.margin_factor)
-            crop_h = int(median_h * self.margin_factor)
+            # Variables for adaptive mode
+            use_adaptive = False
+            adaptive_crop_sizes = None
 
-            # Limit to video size
-            crop_w = min(crop_w, width)
-            crop_h = min(crop_h, height)
+            if aspect_info is not None:
+                # Fixed aspect ratio mode
+                target_w, target_h, target_ratio = aspect_info
+
+                if self.adaptive_crop:
+                    self.progress_update.emit(18, 100, f"Using ADAPTIVE {self.aspect_ratio} (prevents cut-offs)")
+                    use_adaptive = True
+                else:
+                    self.progress_update.emit(18, 100, f"Using {self.aspect_ratio} aspect ratio")
+
+                # Ensure dimensions fit within video
+                if target_w > width or target_h > height:
+                    # Scale down to fit
+                    scale = min(width / target_w, height / target_h)
+                    target_w = int(target_w * scale)
+                    target_h = int(target_h * scale)
+
+                if use_adaptive:
+                    # Pre-calculate adaptive crop sizes
+                    self.progress_update.emit(19, 100, "Calculating adaptive crop sizes...")
+                    raw_crop_sizes = []
+
+                    for frame_num, x, y, w, h in coords:
+                        _, _, adaptive_w, adaptive_h = calculate_adaptive_crop(
+                            x, y, w, h, target_ratio, width, height, self.margin_factor, target_w, target_h
+                        )
+                        raw_crop_sizes.append((adaptive_w, adaptive_h))
+
+                    # Smooth crop sizes
+                    smoothed_sizes = smooth_crop_sizes(raw_crop_sizes, self.smooth_window)
+
+                    # Create dict mapping frame number to crop size
+                    adaptive_crop_sizes = {}
+                    for i, (frame_num, x, y, w, h) in enumerate(coords):
+                        adaptive_crop_sizes[frame_num] = smoothed_sizes[i]
+
+                    crop_w = target_w
+                    crop_h = target_h
+                else:
+                    crop_w = target_w
+                    crop_h = target_h
+            else:
+                # Automatic mode - calculate from tracking
+                self.progress_update.emit(18, 100, "Using automatic aspect ratio")
+
+                # Calculate fixed crop size using 75th percentile (like export_final.py)
+                ws_all = [c[3] for c in coords]
+                hs_all = [c[4] for c in coords]
+                p75_w = int(np.percentile(ws_all, 75))
+                p75_h = int(np.percentile(hs_all, 75))
+
+                crop_w = int(p75_w * self.margin_factor)
+                crop_h = int(p75_h * self.margin_factor)
+
+                # Limit to video size
+                crop_w = min(crop_w, width)
+                crop_h = min(crop_h, height)
 
             self.progress_update.emit(20, 100, f"Crop size: {crop_w}x{crop_h}")
 
@@ -135,20 +310,44 @@ class ExportThread(QThread):
                 # Get coordinates for this frame
                 if frame_num in coords_dict:
                     _, x, y, w, h = coords_dict[frame_num]
-                    crop_x, crop_y, _, _ = self._calculate_fixed_crop(
-                        x, y, w, h, crop_w, crop_h, width, height
-                    )
-                    last_crop_x, last_crop_y = crop_x, crop_y
+
+                    if use_adaptive and frame_num in adaptive_crop_sizes:
+                        # Adaptive mode: use pre-calculated crop size
+                        adaptive_w, adaptive_h = adaptive_crop_sizes[frame_num]
+
+                        # Calculate position with adaptive size
+                        center_x = x + w // 2
+                        center_y = y + h // 2
+                        crop_x = center_x - adaptive_w // 2
+                        crop_y = center_y - adaptive_h // 2
+
+                        # Bounds checking
+                        crop_x = max(0, min(crop_x, width - adaptive_w))
+                        crop_y = max(0, min(crop_y, height - adaptive_h))
+
+                        # Crop and resize to target dimensions
+                        cropped = frame[crop_y:crop_y+adaptive_h, crop_x:crop_x+adaptive_w]
+                        cropped = cv2.resize(cropped, (crop_w, crop_h))
+                    else:
+                        # Fixed mode
+                        crop_x, crop_y, _, _ = self._calculate_fixed_crop(
+                            x, y, w, h, crop_w, crop_h, width, height
+                        )
+                        last_crop_x, last_crop_y = crop_x, crop_y
+
+                        # Crop frame
+                        cropped = frame[crop_y:crop_y+crop_h, crop_x:crop_x+crop_w]
+
+                        # Handle edge case where crop might be slightly off
+                        if cropped.shape[0] != crop_h or cropped.shape[1] != crop_w:
+                            cropped = cv2.resize(cropped, (crop_w, crop_h))
                 else:
                     # Use last known crop position
                     crop_x, crop_y = last_crop_x, last_crop_y
+                    cropped = frame[crop_y:crop_y+crop_h, crop_x:crop_x+crop_w]
 
-                # Crop frame
-                cropped = frame[crop_y:crop_y+crop_h, crop_x:crop_x+crop_w]
-
-                # Handle edge case where crop might be slightly off
-                if cropped.shape[0] != crop_h or cropped.shape[1] != crop_w:
-                    cropped = cv2.resize(cropped, (crop_w, crop_h))
+                    if cropped.shape[0] != crop_h or cropped.shape[1] != crop_w:
+                        cropped = cv2.resize(cropped, (crop_w, crop_h))
 
                 # Write frame
                 out.write(cropped)

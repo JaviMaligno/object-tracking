@@ -367,6 +367,34 @@ class DancerTrackingUI(QMainWindow):
 
         layout.addLayout(smooth_layout)
 
+        # Aspect Ratio
+        aspect_layout = QVBoxLayout()
+        aspect_layout.addWidget(QLabel("Formato de video:"))
+
+        aspect_selector_layout = QHBoxLayout()
+        self.aspect_ratio_combo = QComboBox()
+        self.aspect_ratio_combo.addItem("📱 Instagram (4:5) - 1080x1350", "instagram")
+        self.aspect_ratio_combo.addItem("⬜ Cuadrado (1:1) - 1080x1080", "square")
+        self.aspect_ratio_combo.addItem("📲 iPhone Vertical (9:16) - 1080x1920", "9:16")
+        self.aspect_ratio_combo.addItem("🖥️ Horizontal (16:9) - 1920x1080", "16:9")
+        self.aspect_ratio_combo.addItem("🔄 Automático (ajustar al tracking)", "auto")
+        self.aspect_ratio_combo.setCurrentIndex(0)  # Default to Instagram
+        aspect_selector_layout.addWidget(self.aspect_ratio_combo)
+
+        aspect_layout.addLayout(aspect_selector_layout)
+
+        # Adaptive crop checkbox
+        self.adaptive_crop_checkbox = QCheckBox("Zoom adaptativo (evita que se corten los bailarines)")
+        self.adaptive_crop_checkbox.setChecked(True)  # Default enabled for best quality
+        self.adaptive_crop_checkbox.setToolTip(
+            "Cuando está activado, el zoom se ajusta automáticamente cuando los bailarines están cerca de la cámara.\n"
+            "Esto previene que se corten por arriba/abajo en formato Instagram.\n"
+            "Recomendado: Activado siempre para Instagram"
+        )
+        aspect_layout.addWidget(self.adaptive_crop_checkbox)
+
+        layout.addLayout(aspect_layout)
+
         # Output file
         output_layout = QHBoxLayout()
         output_layout.addWidget(QLabel("Archivo de salida:"))
@@ -870,6 +898,8 @@ class DancerTrackingUI(QMainWindow):
         margin = self.margin_slider.value() / 10.0
         smooth = self.smooth_slider.value()
         output_path = self.output_path_edit.text()
+        aspect_ratio = self.aspect_ratio_combo.currentData()
+        adaptive_crop = self.adaptive_crop_checkbox.isChecked()
 
         # Use custom audio if specified, otherwise use video audio
         audio_source = self.audio_path if self.audio_path else self.video_path
@@ -880,7 +910,9 @@ class DancerTrackingUI(QMainWindow):
             self.coords_csv,
             output_path,
             margin,
-            smooth
+            smooth,
+            aspect_ratio,
+            adaptive_crop
         )
         self.export_thread.progress_update.connect(self._on_export_progress)
         self.export_thread.export_complete.connect(self._on_export_complete)
