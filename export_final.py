@@ -84,6 +84,105 @@ def interpolate_gaps(coords):
     return result
 
 
+def stabilize_and_smooth_coordinates_ema(coords, smooth_window=45):
+    """
+    Stabilize and smooth coordinates using EMA (Exponential Moving Average)
+    Better for YOLO tracking which re-detects every frame
+    """
+    if len(coords) < 2:
+        return coords
+
+    frames = [c[0] for c in coords]
+    xs = [c[1] for c in coords]
+    ys = [c[2] for c in coords]
+    ws = [c[3] for c in coords]
+    hs = [c[4] for c in coords]
+
+    print(f"   Applying EMA smoothing (alpha based on window={smooth_window}) to all dimensions...")
+
+    # Calculate alpha from smooth_window
+    # alpha = 2 / (window + 1) gives more weight to recent values
+    alpha = 2.0 / (smooth_window + 1)
+    print(f"   EMA alpha: {alpha:.4f}")
+
+    # First pass: Remove outliers using median filter
+    xs_filtered = []
+    ys_filtered = []
+    ws_filtered = []
+    hs_filtered = []
+
+    for i in range(len(xs)):
+        start = max(0, i - smooth_window // 2)
+        end = min(len(xs), i + smooth_window // 2 + 1)
+
+        window_xs = xs[start:end]
+        window_ys = ys[start:end]
+        window_ws = ws[start:end]
+        window_hs = hs[start:end]
+
+        median_x = np.median(window_xs)
+        median_y = np.median(window_ys)
+        median_w = np.median(window_ws)
+        median_h = np.median(window_hs)
+
+        # Outlier detection for position (X, Y) - threshold 200px
+        if abs(xs[i] - median_x) > 200:
+            xs_filtered.append(median_x)
+        else:
+            xs_filtered.append(xs[i])
+
+        if abs(ys[i] - median_y) > 200:
+            ys_filtered.append(median_y)
+        else:
+            ys_filtered.append(ys[i])
+
+        # Outlier detection for size (W, H) - using percentile-based approach
+        p75_w = np.percentile(window_ws, 75)
+        p75_h = np.percentile(window_hs, 75)
+
+        # If value is more than 50% larger than 75th percentile, use median
+        if ws[i] > p75_w * 1.5:
+            ws_filtered.append(median_w)
+        else:
+            ws_filtered.append(ws[i])
+
+        if hs[i] > p75_h * 1.5:
+            hs_filtered.append(median_h)
+        else:
+            hs_filtered.append(hs[i])
+
+    # Second pass: Apply EMA smoothing
+    smoothed = []
+
+    # Initialize with first frame (no smoothing)
+    ema_x = xs_filtered[0]
+    ema_y = ys_filtered[0]
+    ema_w = ws_filtered[0]
+    ema_h = hs_filtered[0]
+
+    smoothed.append((frames[0], int(ema_x), int(ema_y), int(ema_w), int(ema_h)))
+
+    # Apply EMA for remaining frames
+    for i in range(1, len(frames)):
+        # EMA formula: new_value = alpha * current + (1 - alpha) * previous_ema
+        ema_x = alpha * xs_filtered[i] + (1 - alpha) * ema_x
+        ema_y = alpha * ys_filtered[i] + (1 - alpha) * ema_y
+        ema_w = alpha * ws_filtered[i] + (1 - alpha) * ema_w
+        ema_h = alpha * hs_filtered[i] + (1 - alpha) * ema_h
+
+        smoothed.append((frames[i], int(ema_x), int(ema_y), int(ema_w), int(ema_h)))
+
+    # Report statistics
+    min_w = min([s[3] for s in smoothed])
+    max_w = max([s[3] for s in smoothed])
+    min_h = min([s[4] for s in smoothed])
+    max_h = max([s[4] for s in smoothed])
+
+    print(f"   Size range after EMA smoothing: W={min_w}-{max_w}, H={min_h}-{max_h}")
+
+    return smoothed
+
+
 def stabilize_and_smooth_coordinates(coords, smooth_window=15):
     """Stabilise et lisse les coordonnées avec rolling window pour TOUTES les dimensions"""
     if len(coords) < smooth_window:
@@ -244,8 +343,8 @@ def crop_and_export_fixed_ratio(video_path, coords_csv, output_path="output.mov"
     coords = interpolate_gaps(coords)
     print()
 
-    print(f"Stabilizing and smoothing (window={smooth_window})...")
-    coords = stabilize_and_smooth_coordinates(coords, smooth_window)
+    print(f"Stabilizing and smoothing with EMA (window={smooth_window})...")
+    coords = stabilize_and_smooth_coordinates_ema(coords, smooth_window)
     print()
 
     # Calculer la taille de crop usando percentil para evitar outliers extremos
