@@ -638,14 +638,59 @@ def crop_and_export_fixed_ratio(video_path, coords_csv, output_path="output.mov"
     print(f"First tracked frame: {first_tracked_frame}")
     print()
 
-    # Fichier temporaire
-    temp_output = output_path.replace('.mov', '_temp.avi')
+    # Direct pipe to FFmpeg (no intermediate MJPEG codec for better quality)
+    print("Setting up direct FFmpeg pipe...")
 
-    fourcc = cv2.VideoWriter_fourcc(*'MJPG')
-    out = cv2.VideoWriter(temp_output, fourcc, fps, (crop_w, crop_h))
+    # Buscar FFmpeg en la ubicación local primero
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    ffmpeg_local = os.path.join(script_dir, 'ffmpeg', 'bin', 'ffmpeg.exe')
 
-    if not out.isOpened():
-        print("ERROR: Cannot create output file")
+    if os.path.exists(ffmpeg_local):
+        ffmpeg_cmd = ffmpeg_local
+        print(f"   Using local FFmpeg: {ffmpeg_cmd}")
+    else:
+        ffmpeg_cmd = 'ffmpeg'
+        print("   Using system FFmpeg")
+
+    # FFmpeg command to receive raw BGR frames and encode directly to H.264
+    ffmpeg_cmd_list = [
+        ffmpeg_cmd,
+        '-y',  # Overwrite output file
+        '-f', 'rawvideo',
+        '-vcodec', 'rawvideo',
+        '-s', f'{crop_w}x{crop_h}',
+        '-pix_fmt', 'bgr24',  # OpenCV uses BGR
+        '-r', str(fps),
+        '-i', '-',  # Read from stdin
+        '-i', video_path,  # Audio source
+        '-map', '0:v',  # Video from stdin
+        '-map', '1:a',  # Audio from video file
+        '-c:v', 'libx264',
+        '-preset', 'slow',
+        '-crf', '16',
+        '-pix_fmt', 'yuv420p',
+        # Explicit colorspace flags
+        '-colorspace', 'bt709',
+        '-color_primaries', 'bt709',
+        '-color_trc', 'bt709',
+        '-color_range', 'tv',
+        '-c:a', 'aac',
+        '-b:a', '192k',
+        '-movflags', '+faststart',
+        '-shortest',
+        output_path
+    ]
+
+    # Start FFmpeg process
+    try:
+        ffmpeg_process = subprocess.Popen(
+            ffmpeg_cmd_list,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+    except FileNotFoundError:
+        print(f"ERROR: FFmpeg not found at {ffmpeg_cmd}")
         video.release()
         sys.exit(1)
 
@@ -653,6 +698,7 @@ def crop_and_export_fixed_ratio(video_path, coords_csv, output_path="output.mov"
         print("Processing video with ADAPTIVE ASPECT RATIO (zoom adjusts to fit dancers)...")
     else:
         print("Processing video with FIXED ASPECT RATIO...")
+    print("Encoding directly to H.264 (no intermediate codec)...")
     print()
 
     video.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -704,10 +750,20 @@ def crop_and_export_fixed_ratio(video_path, coords_csv, output_path="output.mov"
         cropped = frame[crop_y:crop_y+crop_h_frame, crop_x:crop_x+crop_w_frame]
 
         # Resize to target dimensions (important for adaptive mode)
+        # Using LANCZOS4 for high-quality downsampling (preserves sharpness and detail)
         if use_adaptive or cropped.shape[1] != crop_w or cropped.shape[0] != crop_h:
-            cropped = cv2.resize(cropped, (crop_w, crop_h))
+            cropped = cv2.resize(cropped, (crop_w, crop_h), interpolation=cv2.INTER_LANCZOS4)
 
-        out.write(cropped)
+        # Write frame as raw bytes to FFmpeg stdin
+        try:
+            ffmpeg_process.stdin.write(cropped.tobytes())
+        except BrokenPipeError:
+            print("\nERROR: FFmpeg pipe broken. Check FFmpeg output below:")
+            stderr_output = ffmpeg_process.stderr.read().decode('utf-8', errors='ignore')
+            print(stderr_output)
+            video.release()
+            sys.exit(1)
+
         processed_count += 1
 
         if frame_count % 30 == 0:
@@ -715,59 +771,57 @@ def crop_and_export_fixed_ratio(video_path, coords_csv, output_path="output.mov"
             print(f"   Progress: {progress:.1f}% ({frame_count}/{total_frames} frames)")
 
     video.release()
-    out.release()
 
+    # Close FFmpeg stdin and wait for it to finish
     print()
     print(f"Processed {processed_count} frames")
+    print("Finalizing video encoding...")
+    print("(FFmpeg is compressing with preset 'slow' - this may take several minutes)")
     print()
 
-    # Ajouter l'audio
-    print("Converting to MOV with H.264 and adding audio...")
+    ffmpeg_process.stdin.close()
 
-    # Buscar FFmpeg en la ubicación local primero
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    ffmpeg_local = os.path.join(script_dir, 'ffmpeg', 'bin', 'ffmpeg.exe')
+    # Read FFmpeg stderr in real-time to show progress
+    import threading
+    import re
 
-    if os.path.exists(ffmpeg_local):
-        ffmpeg_cmd = ffmpeg_local
-        print(f"   Using local FFmpeg: {ffmpeg_cmd}")
-    else:
-        ffmpeg_cmd = 'ffmpeg'
-        print("   Using system FFmpeg")
+    def read_ffmpeg_progress():
+        """Read FFmpeg stderr and display progress"""
+        for line in iter(ffmpeg_process.stderr.readline, b''):
+            try:
+                line_str = line.decode('utf-8', errors='ignore').strip()
+                # FFmpeg progress lines contain 'frame=', 'fps=', 'time='
+                if 'frame=' in line_str and 'fps=' in line_str:
+                    # Extract frame number and fps
+                    frame_match = re.search(r'frame=\s*(\d+)', line_str)
+                    fps_match = re.search(r'fps=\s*([\d.]+)', line_str)
+                    time_match = re.search(r'time=\s*([\d:\.]+)', line_str)
 
-    cmd = [
-        ffmpeg_cmd,
-        '-i', temp_output,
-        '-i', video_path,
-        '-map', '0:v',
-        '-map', '1:a',
-        '-c:v', 'libx264',
-        '-preset', 'medium',
-        '-crf', '18',
-        '-pix_fmt', 'yuv420p',
-        '-c:a', 'aac',
-        '-b:a', '192k',
-        '-movflags', '+faststart',
-        '-shortest',
-        '-y',
-        output_path
-    ]
+                    if frame_match:
+                        frame_num = frame_match.group(1)
+                        fps_val = fps_match.group(1) if fps_match else '?'
+                        time_val = time_match.group(1) if time_match else '?'
+                        print(f"\r   FFmpeg encoding: frame {frame_num}, {fps_val} fps, time {time_val}", end='', flush=True)
+            except:
+                pass
 
-    try:
-        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-        print("Audio added successfully!")
-        os.remove(temp_output)
-    except FileNotFoundError:
-        print("ERROR: FFmpeg not found!")
-        print(f"Tried: {ffmpeg_cmd}")
-        print("Output file WITHOUT audio saved as: {temp_output}")
-        print("\nPlease install FFmpeg or ensure it's in the correct location.")
+    # Start progress reading thread
+    progress_thread = threading.Thread(target=read_ffmpeg_progress, daemon=True)
+    progress_thread.start()
+
+    # Wait for FFmpeg to finish
+    ffmpeg_process.wait()
+    progress_thread.join(timeout=1.0)
+    print()  # New line after progress
+
+    # Check for errors
+    if ffmpeg_process.returncode != 0:
+        print("\nERROR: FFmpeg encoding failed!")
+        print("Check the output above for details.")
         return False
-    except subprocess.CalledProcessError as e:
-        print("WARNING: Could not add audio")
-        print(f"FFmpeg error: {e.stderr}")
-        print(f"Output file without audio: {temp_output}")
-        return False
+
+    print("Video encoding complete!")
+    print()
 
     print()
     print("=" * 50)
@@ -783,7 +837,11 @@ def crop_and_export_fixed_ratio(video_path, coords_csv, output_path="output.mov"
     print("Video specs:")
     print(f"   Resolution: {crop_w}x{crop_h}")
     print(f"   Aspect ratio: {final_ratio:.2f}")
-    print(f"   NO DISTORTION - Fixed size maintained throughout")
+    print(f"   Quality improvements:")
+    print(f"      - LANCZOS4 interpolation (high-quality)")
+    print(f"      - Direct FFmpeg pipe (no intermediate codec)")
+    print(f"      - Explicit colorspace (BT.709)")
+    print(f"      - CRF 16 + slow preset")
 
     return True
 

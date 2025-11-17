@@ -20,3 +20,15 @@ IMG_3048_con_Arjona_converted.mp4
 *.webp
 __pycache__
 *.pt
+*.txt
+*.log
+*.json
+*.yaml
+*.yml
+*.xml
+*.csv
+*.tsv
+*.txt
+*.log
+*.json
+*.yaml
