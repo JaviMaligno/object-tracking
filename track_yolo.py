@@ -10,6 +10,7 @@ import csv
 import numpy as np
 from ultralytics import YOLO
 from pathlib import Path
+from tqdm import tqdm
 
 
 class YOLODancerTracker:
@@ -42,8 +43,14 @@ class YOLODancerTracker:
 
         # Cargar modelo YOLO
         model_name = f"yolov8{model_size}.pt"
-        print(f"Cargando modelo {model_name}...")
-        self.model = YOLO(model_name)
+        model_path = Path(f"models/{model_name}")
+        
+        if model_path.exists():
+            print(f"Cargando modelo desde {model_path}...")
+            self.model = YOLO(str(model_path))
+        else:
+            print(f"Cargando modelo {model_name} (se descargará si no existe)...")
+            self.model = YOLO(model_name)
 
         # Información del video
         self.cap = cv2.VideoCapture(video_path)
@@ -88,7 +95,7 @@ class YOLODancerTracker:
 
         frame_num = 0
 
-        for result in results:
+        for result in tqdm(results, total=self.frame_count, desc="Tracking"):
             boxes = result.boxes
 
             if boxes is not None and len(boxes) > 0:
@@ -115,10 +122,6 @@ class YOLODancerTracker:
                 progress_callback(frame_num, self.frame_count)
 
             frame_num += 1
-
-            # Mostrar progreso cada 30 frames
-            if frame_num % 30 == 0:
-                print(f"Procesado: {frame_num}/{self.frame_count} frames ({frame_num/self.frame_count*100:.1f}%)")
 
         print(f"\nTracking completado: {frame_num} frames procesados")
 
@@ -309,12 +312,12 @@ def main():
     if len(sys.argv) < 2:
         print("Uso: python track_yolo.py <video_path> [output_csv]")
         print("\nEjemplo:")
-        print("  python track_yolo.py IMG_3048_con_Arjona.mov")
-        print("  python track_yolo.py IMG_3048_con_Arjona.mov coords_yolo.csv")
+        print("  python track_yolo.py data/IMG_3048_con_Arjona.mov")
+        print("  python track_yolo.py data/IMG_3048_con_Arjona.mov outputs/coords_yolo.csv")
         return 1
 
     video_path = sys.argv[1]
-    output_csv = sys.argv[2] if len(sys.argv) > 2 else "coords_yolo.csv"
+    output_csv = sys.argv[2] if len(sys.argv) > 2 else "outputs/coords_yolo.csv"
 
     # Verificar que el video existe
     if not Path(video_path).exists():

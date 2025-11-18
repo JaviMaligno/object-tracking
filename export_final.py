@@ -10,6 +10,7 @@ import sys
 import os
 import subprocess
 import numpy as np
+from tqdm import tqdm
 
 
 def load_coordinates(csv_path):
@@ -707,6 +708,35 @@ def crop_and_export_fixed_ratio(video_path, coords_csv, output_path="output.mov"
     processed_count = 0
     last_crop = (initial_crop_x, initial_crop_y, crop_w, crop_h)
 
+    # Initialize progress bar
+    pbar = tqdm(total=total_frames, desc="Exporting video", unit="frame")
+
+    # Thread to read FFmpeg stderr
+    import threading
+    import re
+    
+    ffmpeg_stats = {"fps": "0", "time": "00:00:00"}
+
+    def read_ffmpeg_progress():
+        for line in iter(ffmpeg_process.stderr.readline, b''):
+            try:
+                line_str = line.decode('utf-8', errors='ignore').strip()
+                if 'frame=' in line_str and 'fps=' in line_str:
+                     # Parse fps and time
+                     fps_match = re.search(r'fps=\s*([\d.]+)', line_str)
+                     time_match = re.search(r'time=\s*([\d:\.]+)', line_str)
+                     
+                     if fps_match: ffmpeg_stats["fps"] = fps_match.group(1)
+                     if time_match: ffmpeg_stats["time"] = time_match.group(1)
+                     
+                     # Update pbar postfix
+                     pbar.set_postfix(fps=ffmpeg_stats["fps"], time=ffmpeg_stats["time"], refresh=False)
+            except:
+                pass
+
+    progress_thread = threading.Thread(target=read_ffmpeg_progress, daemon=True)
+    progress_thread.start()
+
     while True:
         ok, frame = video.read()
         if not ok:
@@ -765,11 +795,9 @@ def crop_and_export_fixed_ratio(video_path, coords_csv, output_path="output.mov"
             sys.exit(1)
 
         processed_count += 1
+        pbar.update(1)
 
-        if frame_count % 30 == 0:
-            progress = (frame_count / total_frames) * 100
-            print(f"   Progress: {progress:.1f}% ({frame_count}/{total_frames} frames)")
-
+    pbar.close()
     video.release()
 
     # Close FFmpeg stdin and wait for it to finish
@@ -782,36 +810,20 @@ def crop_and_export_fixed_ratio(video_path, coords_csv, output_path="output.mov"
     ffmpeg_process.stdin.close()
 
     # Read FFmpeg stderr in real-time to show progress
-    import threading
-    import re
-
-    def read_ffmpeg_progress():
-        """Read FFmpeg stderr and display progress"""
-        for line in iter(ffmpeg_process.stderr.readline, b''):
-            try:
-                line_str = line.decode('utf-8', errors='ignore').strip()
-                # FFmpeg progress lines contain 'frame=', 'fps=', 'time='
-                if 'frame=' in line_str and 'fps=' in line_str:
-                    # Extract frame number and fps
-                    frame_match = re.search(r'frame=\s*(\d+)', line_str)
-                    fps_match = re.search(r'fps=\s*([\d.]+)', line_str)
-                    time_match = re.search(r'time=\s*([\d:\.]+)', line_str)
-
-                    if frame_match:
-                        frame_num = frame_match.group(1)
-                        fps_val = fps_match.group(1) if fps_match else '?'
-                        time_val = time_match.group(1) if time_match else '?'
-                        print(f"\r   FFmpeg encoding: frame {frame_num}, {fps_val} fps, time {time_val}", end='', flush=True)
-            except:
-                pass
-
-    # Start progress reading thread
-    progress_thread = threading.Thread(target=read_ffmpeg_progress, daemon=True)
-    progress_thread.start()
-
-    # Wait for FFmpeg to finish
+    # We don't need this anymore for progress, but maybe to debug or show encoding status
+    # The main progress bar covers the processing/feeding to ffmpeg. 
+    # The encoding happens in parallel but might lag behind.
+    # Let's keep a simple message or just let it finish.
+    # But wait, FFmpeg runs in parallel. The writing to stdin blocks if the pipe is full.
+    # So tqdm reflects the speed of feeding FFmpeg.
+    
+    # We can keep the stderr reading but maybe suppress it or just show final stats?
+    # The user asked for estimation. Tqdm gives it.
+    # The old code had a thread reading stderr. 
+    # Let's remove the thread printing progress to avoid messing up tqdm output.
+    # We can just read stderr at the end if there is an error.
+    
     ffmpeg_process.wait()
-    progress_thread.join(timeout=1.0)
     print()  # New line after progress
 
     # Check for errors
@@ -850,8 +862,8 @@ def main():
     if len(sys.argv) < 3:
         print("Usage: python export_final.py <video> <coords.csv> [output.mov] [options]")
         print("\nExample:")
-        print("  python export_final.py video.mov coords.csv output.mov")
-        print("  python export_final.py video.mov coords.csv output.mov --aspect-ratio instagram --adaptive-crop")
+        print("  python export_final.py data/video.mov outputs/coords.csv outputs/output.mov")
+        print("  python export_final.py data/video.mov outputs/coords.csv outputs/output.mov --aspect-ratio instagram --adaptive-crop")
         print("\nOptions:")
         print("  --margin FACTOR         Margin factor (default: 1.5)")
         print("  --smooth WINDOW         Smoothing window (default: 15)")
@@ -871,7 +883,7 @@ def main():
 
     video_path = sys.argv[1]
     coords_csv = sys.argv[2]
-    output_path = sys.argv[3] if len(sys.argv) > 3 else "output_fixed.mov"
+    output_path = sys.argv[3] if len(sys.argv) > 3 else "outputs/output_fixed.mov"
 
     margin_factor = 1.5
     smooth_window = 15
